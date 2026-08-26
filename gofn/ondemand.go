@@ -198,8 +198,26 @@ func buildOnDemandPayload(shows []odShow, seasons []odSeason, episodes []odEpiso
 			seasonList = append(seasonList, seasonJSON(se, bySeason[se.ID], publishedOnly))
 		}
 
-		// If published-only and all seasons filtered out, keep the show but
-		// with an empty season list — mirror filterPublished (keeps show).
+		// In published-only mode a show with zero published episodes is hidden
+		// entirely (matches get_on_demand_catalog). Keep it only when it still
+		// has at least one episode.
+		if publishedOnly {
+			pubEpisodes := 0
+			for _, se := range rev {
+				if !se.Published {
+					continue
+				}
+				for _, e := range bySeason[se.ID] {
+					if e.Published {
+						pubEpisodes++
+					}
+				}
+			}
+			if pubEpisodes == 0 {
+				continue
+			}
+		}
+
 		out = append(out, map[string]any{
 			"id":          sh.ID,
 			"title":       sh.Title,

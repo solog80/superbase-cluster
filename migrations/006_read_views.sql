@@ -86,6 +86,15 @@ as $$
           )
           from public.tv_shows s
           where s.published = true
+            -- A show only appears when it has at least one published
+            -- episode. Unpublishing all episodes hides the show entirely.
+            and exists (
+              select 1
+              from public.seasons se
+              join public.episodes e
+                on e.season_id = se.id and e.published = true
+              where se.show_id = s.id and se.published = true
+            )
         ),
         '[]'::jsonb
       )
