@@ -180,7 +180,7 @@ func (s *server) dispatch(w http.ResponseWriter, r *http.Request) {
 			s.handleDeleteEvent(w, r)
 		}
 	case "getOnDemandData", "getOnDemandShowById", "getOnDemandSeasonEpisodes",
-		"getPublicOnDemandData", "ondemandHealthCheck":
+		"getPublicOnDemandData", "ondemandHealthCheck", "getSignedPlaylist":
 		switch name {
 		case "getOnDemandData":
 			s.handleGetOnDemandData(w, r)
@@ -190,6 +190,8 @@ func (s *server) dispatch(w http.ResponseWriter, r *http.Request) {
 			s.handleGetOnDemandSeasonEpisodes(w, r)
 		case "getPublicOnDemandData":
 			s.handleGetPublicOnDemandData(w, r)
+		case "getSignedPlaylist":
+			s.handleGetSignedPlaylist(w, r)
 		case "ondemandHealthCheck":
 			s.handleOndemandHealthCheck(w, r)
 		}
@@ -264,6 +266,7 @@ func (s *server) publicFn(name string) bool {
 		"getOnDemandShowById",
 		"getOnDemandSeasonEpisodes",
 		"getPublicOnDemandData",
+		"getSignedPlaylist",
 		"ondemandHealthCheck":
 		return true
 	}
