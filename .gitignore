@@ -1,0 +1,11 @@
+# Built artifacts
+gofn/salt-gofn
+*.exe
+
+# Local env / secrets
+.env
+*.env
+!*.example
+
+# OS
+.DS_Store
