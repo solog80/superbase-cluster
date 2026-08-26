@@ -1,0 +1,976 @@
+{
+  "meta": {
+    "type": "db",
+    "canSave": true,
+    "canEdit": true,
+    "canAdmin": true,
+    "canStar": true,
+    "canDelete": true,
+    "slug": "supabase-mesh-overview",
+    "url": "/d/supabase-mesh/supabase-mesh-overview",
+    "expires": "0001-01-01T00:00:00Z",
+    "created": "2026-08-22T06:31:17Z",
+    "updated": "2026-08-26T09:54:31Z",
+    "updatedBy": "admin",
+    "createdBy": "admin",
+    "version": 7,
+    "hasAcl": false,
+    "isFolder": false,
+    "apiVersion": "v0alpha1",
+    "folderId": 0,
+    "folderUid": "",
+    "folderTitle": "General",
+    "folderUrl": "",
+    "provisioned": false,
+    "provisionedExternalId": "",
+    "annotationsPermissions": {
+      "dashboard": {
+        "canAdd": true,
+        "canEdit": true,
+        "canDelete": true
+      }
+    }
+  },
+  "dashboard": {
+    "id": 1380328936251392,
+    "panels": [
+      {
+        "datasource": {
+          "type": "prometheus",
+          "uid": "efvx7rb171yioc"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "decimals": 1,
+            "unit": "percent"
+          },
+          "overrides": []
+        },
+        "gridPos": {
+          "h": 6,
+          "w": 4,
+          "x": 0,
+          "y": 0
+        },
+        "id": 1001,
+        "options": {
+          "colorMode": "background",
+          "graphMode": "area",
+          "reduceOptions": {
+            "calcs": [
+              "lastNotNull"
+            ],
+            "values": false
+          }
+        },
+        "targets": [
+          {
+            "expr": "100 - (avg by (instance) (rate(node_cpu_seconds_total{instance=~\"$instance\",mode=\"idle\"}[5m])) * 100)",
+            "legendFormat": "{{instance}}",
+            "refId": "A"
+          }
+        ],
+        "title": "CPU usage (%)",
+        "type": "stat"
+      },
+      {
+        "datasource": {
+          "type": "prometheus",
+          "uid": "efvx7rb171yioc"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "decimals": 1,
+            "unit": "percent"
+          },
+          "overrides": []
+        },
+        "gridPos": {
+          "h": 6,
+          "w": 4,
+          "x": 4,
+          "y": 0
+        },
+        "id": 1002,
+        "options": {
+          "colorMode": "background",
+          "graphMode": "area",
+          "reduceOptions": {
+            "calcs": [
+              "lastNotNull"
+            ],
+            "values": false
+          }
+        },
+        "targets": [
+          {
+            "expr": "100 * (1 - node_memory_MemAvailable_bytes{instance=~\"$instance\"} / node_memory_MemTotal_bytes{instance=~\"$instance\"})",
+            "legendFormat": "{{instance}}",
+            "refId": "A"
+          }
+        ],
+        "title": "Memory usage (%)",
+        "type": "stat"
+      },
+      {
+        "datasource": {
+          "type": "prometheus",
+          "uid": "efvx7rb171yioc"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "decimals": 1,
+            "unit": "percent"
+          },
+          "overrides": []
+        },
+        "gridPos": {
+          "h": 6,
+          "w": 4,
+          "x": 8,
+          "y": 0
+        },
+        "id": 1003,
+        "options": {
+          "colorMode": "background",
+          "graphMode": "area",
+          "reduceOptions": {
+            "calcs": [
+              "lastNotNull"
+            ],
+            "values": false
+          }
+        },
+        "targets": [
+          {
+            "expr": "100 - (node_filesystem_avail_bytes{instance=~\"$instance\",mountpoint=\"/\"} / node_filesystem_size_bytes{instance=~\"$instance\",mountpoint=\"/\"} * 100)",
+            "legendFormat": "{{instance}}",
+            "refId": "A"
+          }
+        ],
+        "title": "Disk usage / (%)",
+        "type": "stat"
+      },
+      {
+        "datasource": {
+          "type": "prometheus",
+          "uid": "efvx7rb171yioc"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "decimals": 2,
+            "unit": "short"
+          },
+          "overrides": []
+        },
+        "gridPos": {
+          "h": 6,
+          "w": 4,
+          "x": 12,
+          "y": 0
+        },
+        "id": 1004,
+        "options": {
+          "colorMode": "background",
+          "graphMode": "area",
+          "reduceOptions": {
+            "calcs": [
+              "lastNotNull"
+            ],
+            "values": false
+          }
+        },
+        "targets": [
+          {
+            "expr": "node_load1{instance=~\"$instance\"}",
+            "legendFormat": "{{instance}}",
+            "refId": "A"
+          }
+        ],
+        "title": "Load (1m)",
+        "type": "stat"
+      },
+      {
+        "datasource": {
+          "type": "prometheus",
+          "uid": "efvx7rb171yioc"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "decimals": 1,
+            "unit": "short"
+          },
+          "overrides": []
+        },
+        "gridPos": {
+          "h": 6,
+          "w": 4,
+          "x": 16,
+          "y": 0
+        },
+        "id": 1005,
+        "options": {
+          "colorMode": "background",
+          "graphMode": "area",
+          "reduceOptions": {
+            "calcs": [
+              "lastNotNull"
+            ],
+            "values": false
+          }
+        },
+        "targets": [
+          {
+            "expr": "sum by (instance) (pg_stat_database_numbackends{instance=~\"$instance\",datname=\"postgres\"})",
+            "legendFormat": "{{instance}}",
+            "refId": "A"
+          }
+        ],
+        "title": "PG connections",
+        "type": "stat"
+      },
+      {
+        "datasource": {
+          "type": "prometheus",
+          "uid": "efvx7rb171yioc"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "decimals": 1,
+            "unit": "s"
+          },
+          "overrides": []
+        },
+        "gridPos": {
+          "h": 6,
+          "w": 4,
+          "x": 20,
+          "y": 0
+        },
+        "id": 1006,
+        "options": {
+          "colorMode": "background",
+          "graphMode": "area",
+          "reduceOptions": {
+            "calcs": [
+              "lastNotNull"
+            ],
+            "values": false
+          }
+        },
+        "targets": [
+          {
+            "expr": "pg_replication_lag_seconds{instance=~\"$instance\"}",
+            "legendFormat": "{{instance}}",
+            "refId": "A"
+          }
+        ],
+        "title": "Replication lag (s)",
+        "type": "stat"
+      },
+      {
+        "datasource": {
+          "type": "prometheus",
+          "uid": "efvx7rb171yioc"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "decimals": 1,
+            "max": 100,
+            "min": 0,
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "yellow",
+                  "value": 80
+                },
+                {
+                  "color": "red",
+                  "value": 90
+                }
+              ]
+            },
+            "unit": "percent"
+          },
+          "overrides": []
+        },
+        "gridPos": {
+          "h": 6,
+          "w": 4,
+          "x": 0,
+          "y": 6
+        },
+        "id": 1008,
+        "options": {
+          "showThresholdLabels": false,
+          "showThresholdMarkers": true
+        },
+        "targets": [
+          {
+            "expr": "100 - (avg by (instance) (rate(node_cpu_seconds_total{instance=~\"$instance\",mode=\"idle\"}[5m])) * 100)",
+            "legendFormat": "{{instance}}",
+            "refId": "A"
+          }
+        ],
+        "title": "CPU usage",
+        "type": "gauge"
+      },
+      {
+        "datasource": {
+          "type": "prometheus",
+          "uid": "efvx7rb171yioc"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "decimals": 1,
+            "max": 100,
+            "min": 0,
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "yellow",
+                  "value": 80
+                },
+                {
+                  "color": "red",
+                  "value": 90
+                }
+              ]
+            },
+            "unit": "percent"
+          },
+          "overrides": []
+        },
+        "gridPos": {
+          "h": 6,
+          "w": 4,
+          "x": 4,
+          "y": 6
+        },
+        "id": 1009,
+        "options": {
+          "showThresholdLabels": false,
+          "showThresholdMarkers": true
+        },
+        "targets": [
+          {
+            "expr": "100 * (1 - node_memory_MemAvailable_bytes{instance=~\"$instance\"} / node_memory_MemTotal_bytes{instance=~\"$instance\"})",
+            "legendFormat": "{{instance}}",
+            "refId": "A"
+          }
+        ],
+        "title": "Memory usage",
+        "type": "gauge"
+      },
+      {
+        "datasource": {
+          "type": "prometheus",
+          "uid": "efvx7rb171yioc"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "decimals": 1,
+            "max": 100,
+            "min": 0,
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "yellow",
+                  "value": 80
+                },
+                {
+                  "color": "red",
+                  "value": 90
+                }
+              ]
+            },
+            "unit": "percent"
+          },
+          "overrides": []
+        },
+        "gridPos": {
+          "h": 6,
+          "w": 4,
+          "x": 8,
+          "y": 6
+        },
+        "id": 1010,
+        "options": {
+          "showThresholdLabels": false,
+          "showThresholdMarkers": true
+        },
+        "targets": [
+          {
+            "expr": "100 - (node_filesystem_avail_bytes{instance=~\"$instance\",mountpoint=\"/\"} / node_filesystem_size_bytes{instance=~\"$instance\",mountpoint=\"/\"} * 100)",
+            "legendFormat": "{{instance}}",
+            "refId": "A"
+          }
+        ],
+        "title": "Disk usage /",
+        "type": "gauge"
+      },
+      {
+        "datasource": {
+          "type": "prometheus",
+          "uid": "efvx7rb171yioc"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "decimals": 1,
+            "unit": "decbytes"
+          },
+          "overrides": []
+        },
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 0,
+          "y": 12
+        },
+        "id": 1012,
+        "options": {
+          "displayLabels": [
+            "name",
+            "value"
+          ],
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom"
+          },
+          "pieType": "donut",
+          "reduceOptions": {
+            "calcs": [
+              "lastNotNull"
+            ]
+          }
+        },
+        "targets": [
+          {
+            "expr": "(node_memory_MemTotal_bytes{instance=~\"$instance\"} - node_memory_MemAvailable_bytes{instance=~\"$instance\"}) / 1073741824",
+            "legendFormat": "{{instance}}",
+            "refId": "A"
+          }
+        ],
+        "title": "Memory used per node (GB)",
+        "type": "piechart"
+      },
+      {
+        "datasource": {
+          "type": "prometheus",
+          "uid": "efvx7rb171yioc"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "decimals": 1,
+            "unit": "decbytes"
+          },
+          "overrides": []
+        },
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 12,
+          "y": 12
+        },
+        "id": 1013,
+        "options": {
+          "displayLabels": [
+            "name",
+            "value"
+          ],
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom"
+          },
+          "pieType": "donut",
+          "reduceOptions": {
+            "calcs": [
+              "lastNotNull"
+            ]
+          }
+        },
+        "targets": [
+          {
+            "expr": "(node_filesystem_size_bytes{instance=~\"$instance\",mountpoint=\"/\"} - node_filesystem_avail_bytes{instance=~\"$instance\",mountpoint=\"/\"}) / 1073741824",
+            "legendFormat": "{{instance}}",
+            "refId": "A"
+          }
+        ],
+        "title": "Disk used per node (GB)",
+        "type": "piechart"
+      },
+      {
+        "datasource": {
+          "type": "prometheus",
+          "uid": "efvx7rb171yioc"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "decimals": 2,
+            "unit": "decmbytes"
+          },
+          "overrides": []
+        },
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 0,
+          "y": 20
+        },
+        "id": 1015,
+        "options": {
+          "legend": {
+            "displayMode": "list"
+          },
+          "tooltip": {
+            "mode": "multi"
+          }
+        },
+        "targets": [
+          {
+            "expr": "rate(node_network_receive_bytes_total{instance=~\"$instance\"}[5m])/1048576",
+            "legendFormat": "{{instance}}",
+            "refId": "A"
+          }
+        ],
+        "title": "Network RX (MB/s)",
+        "type": "timeseries"
+      },
+      {
+        "datasource": {
+          "type": "prometheus",
+          "uid": "efvx7rb171yioc"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "decimals": 2,
+            "unit": "decmbytes"
+          },
+          "overrides": []
+        },
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 12,
+          "y": 20
+        },
+        "id": 1016,
+        "options": {
+          "legend": {
+            "displayMode": "list"
+          },
+          "tooltip": {
+            "mode": "multi"
+          }
+        },
+        "targets": [
+          {
+            "expr": "rate(node_network_transmit_bytes_total{instance=~\"$instance\"}[5m])/1048576",
+            "legendFormat": "{{instance}}",
+            "refId": "A"
+          }
+        ],
+        "title": "Network TX (MB/s)",
+        "type": "timeseries"
+      },
+      {
+        "datasource": {
+          "type": "prometheus",
+          "uid": "efvx7rb171yioc"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "decimals": 2,
+            "unit": "short"
+          },
+          "overrides": []
+        },
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 0,
+          "y": 28
+        },
+        "id": 1018,
+        "options": {
+          "legend": {
+            "displayMode": "list"
+          },
+          "tooltip": {
+            "mode": "multi"
+          }
+        },
+        "targets": [
+          {
+            "expr": "sum by (instance) (pg_stat_database_numbackends{instance=~\"$instance\",datname=\"postgres\"})",
+            "legendFormat": "{{instance}}",
+            "refId": "A"
+          }
+        ],
+        "title": "Connections (postgres db)",
+        "type": "timeseries"
+      },
+      {
+        "datasource": {
+          "type": "prometheus",
+          "uid": "efvx7rb171yioc"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "decimals": 2,
+            "unit": "ops"
+          },
+          "overrides": []
+        },
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 12,
+          "y": 28
+        },
+        "id": 1019,
+        "options": {
+          "legend": {
+            "displayMode": "list"
+          },
+          "tooltip": {
+            "mode": "multi"
+          }
+        },
+        "targets": [
+          {
+            "expr": "sum by (instance) (rate(pg_stat_database_xact_commit{instance=~\"$instance\"}[5m]) + rate(pg_stat_database_xact_rollback{instance=~\"$instance\"}[5m]))",
+            "legendFormat": "{{instance}}",
+            "refId": "A"
+          }
+        ],
+        "title": "Transactions / sec",
+        "type": "timeseries"
+      },
+      {
+        "datasource": {
+          "type": "prometheus",
+          "uid": "efvx7rb171yioc"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "decimals": 2,
+            "unit": "percent"
+          },
+          "overrides": []
+        },
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 0,
+          "y": 36
+        },
+        "id": 1020,
+        "options": {
+          "legend": {
+            "displayMode": "list"
+          },
+          "tooltip": {
+            "mode": "multi"
+          }
+        },
+        "targets": [
+          {
+            "expr": "100 * sum by (instance) (pg_stat_database_blks_hit{instance=~\"$instance\"}) / (sum by (instance) (pg_stat_database_blks_hit{instance=~\"$instance\"}) + sum by (instance) (pg_stat_database_blks_read{instance=~\"$instance\"}))",
+            "legendFormat": "{{instance}}",
+            "refId": "A"
+          }
+        ],
+        "title": "Cache hit ratio (%)",
+        "type": "timeseries"
+      },
+      {
+        "datasource": {
+          "type": "prometheus",
+          "uid": "efvx7rb171yioc"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "decimals": 2,
+            "unit": "s"
+          },
+          "overrides": []
+        },
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 12,
+          "y": 36
+        },
+        "id": 1022,
+        "options": {
+          "legend": {
+            "displayMode": "list"
+          },
+          "tooltip": {
+            "mode": "multi"
+          }
+        },
+        "targets": [
+          {
+            "expr": "pg_replication_lag_seconds{instance=~\"$instance\"}",
+            "legendFormat": "{{instance}}",
+            "refId": "A"
+          }
+        ],
+        "title": "Replication lag (sec)",
+        "type": "timeseries"
+      },
+      {
+        "datasource": {
+          "type": "prometheus",
+          "uid": "efvx7rb171yioc"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "decimals": 2,
+            "unit": "short"
+          },
+          "overrides": []
+        },
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 0,
+          "y": 44
+        },
+        "id": 1023,
+        "options": {
+          "legend": {
+            "displayMode": "list"
+          },
+          "tooltip": {
+            "mode": "multi"
+          }
+        },
+        "targets": [
+          {
+            "expr": "pg_replication_is_replica{instance=~\"$instance\"}",
+            "legendFormat": "{{instance}}",
+            "refId": "A"
+          }
+        ],
+        "title": "Role (1=replica, 0=primary)",
+        "type": "timeseries"
+      },
+      {
+        "datasource": {
+          "type": "prometheus",
+          "uid": "efvx7rb171yioc"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "decimals": 1,
+            "unit": "bytes"
+          },
+          "overrides": [
+            {
+              "matcher": {
+                "id": "byName",
+                "options": "us1 used"
+              },
+              "properties": [
+                {
+                  "id": "displayName",
+                  "value": "us1 used"
+                }
+              ]
+            },
+            {
+              "matcher": {
+                "id": "byName",
+                "options": "us1 total"
+              },
+              "properties": [
+                {
+                  "id": "displayName",
+                  "value": "us1 total"
+                }
+              ]
+            },
+            {
+              "matcher": {
+                "id": "byName",
+                "options": "ug used"
+              },
+              "properties": [
+                {
+                  "id": "displayName",
+                  "value": "ug used"
+                }
+              ]
+            },
+            {
+              "matcher": {
+                "id": "byName",
+                "options": "ug total"
+              },
+              "properties": [
+                {
+                  "id": "displayName",
+                  "value": "ug total"
+                }
+              ]
+            },
+            {
+              "matcher": {
+                "id": "byName",
+                "options": "eu1 used"
+              },
+              "properties": [
+                {
+                  "id": "displayName",
+                  "value": "eu1 used"
+                }
+              ]
+            },
+            {
+              "matcher": {
+                "id": "byName",
+                "options": "eu1 total"
+              },
+              "properties": [
+                {
+                  "id": "displayName",
+                  "value": "eu1 total"
+                }
+              ]
+            },
+            {
+              "matcher": {
+                "id": "byName",
+                "options": "eu2 used"
+              },
+              "properties": [
+                {
+                  "id": "displayName",
+                  "value": "eu2 used"
+                }
+              ]
+            },
+            {
+              "matcher": {
+                "id": "byName",
+                "options": "eu2 total"
+              },
+              "properties": [
+                {
+                  "id": "displayName",
+                  "value": "eu2 total"
+                }
+              ]
+            },
+            {
+              "matcher": {
+                "id": "byName",
+                "options": "us2 used"
+              },
+              "properties": [
+                {
+                  "id": "displayName",
+                  "value": "us2 used"
+                }
+              ]
+            },
+            {
+              "matcher": {
+                "id": "byName",
+                "options": "us2 total"
+              },
+              "properties": [
+                {
+                  "id": "displayName",
+                  "value": "us2 total"
+                }
+              ]
+            }
+          ]
+        },
+        "gridPos": {
+          "h": 8,
+          "w": 8,
+          "x": 12,
+          "y": 6
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "none",
+          "reduceOptions": {
+            "calcs": [],
+            "fields": "",
+            "values": true
+          },
+          "textMode": "value_and_name"
+        },
+        "targets": [
+          {
+            "expr": "sum by (instance) (node_filesystem_size_bytes{instance=~\"$instance\",mountpoint!~\"/run.*|/etc.*|/proc.*|/sys.*|/dev.*|/boot|/mnt/boot.*|/snap.*|/tmp.*|/share/NFS.*|/samba.*|/mnt/snapshot.*|/share$\"} - node_filesystem_avail_bytes{instance=~\"$instance\",mountpoint!~\"/run.*|/etc.*|/proc.*|/sys.*|/dev.*|/boot|/mnt/boot.*|/snap.*|/tmp.*|/share/NFS.*|/samba.*|/mnt/snapshot.*|/share$\"})",
+            "legendFormat": "{{instance}} used",
+            "refId": "A"
+          },
+          {
+            "expr": "sum by (instance) (node_filesystem_size_bytes{instance=~\"$instance\",mountpoint!~\"/run.*|/etc.*|/proc.*|/sys.*|/dev.*|/boot|/mnt/boot.*|/snap.*|/tmp.*|/share/NFS.*|/samba.*|/mnt/snapshot.*|/share$\"})",
+            "legendFormat": "{{instance}} total",
+            "refId": "B"
+          }
+        ],
+        "title": "Disk space (used / total)",
+        "type": "stat"
+      }
+    ],
+    "refresh": "10s",
+    "schemaVersion": 38,
+    "tags": [
+      "supabase",
+      "mesh"
+    ],
+    "templating": {
+      "list": [
+        {
+          "allValue": "us1|ug|eu1|eu2|us2",
+          "current": {
+            "text": "All",
+            "value": "$__all"
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "efvx7rb171yioc"
+          },
+          "includeAll": true,
+          "multi": true,
+          "name": "instance",
+          "query": "label_values(up{job=\"node\",instance!~\".*:.*\"}, instance)",
+          "type": "query"
+        }
+      ]
+    },
+    "time": {
+      "from": "now-1h",
+      "to": "now"
+    },
+    "timezone": "utc",
+    "title": "Supabase Mesh Overview",
+    "uid": "supabase-mesh",
+    "version": 7
+  }
+}
