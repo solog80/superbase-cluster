@@ -1,0 +1,23 @@
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: 'default'
+  group_by: ['alertname', 'instance']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+receivers:
+  - name: 'default'
+    # Configure one or both notification channels. Email requires SMTP creds
+    # (e.g. a Gmail app password). Webhook can point at Slack/Discord/Telegram.
+    email_configs:
+      - to: 'ALERTS_EMAIL'
+        from: 'ALERTS_FROM_EMAIL'
+        smarthost: 'smtp.gmail.com:587'
+        auth_username: 'ALERTS_SMTP_USER'
+        auth_password: 'ALERTS_SMTP_PASSWORD'
+        require_tls: true
+    # webhook_configs:
+    #   - url: 'https://hooks.slack.com/services/...'

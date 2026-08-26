@@ -1,0 +1,102 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager:9093']
+
+scrape_configs:
+  - job_name: node
+    static_configs:
+      - targets:
+          - 100.74.77.39:9100    # us1 primary
+          - 100.116.185.70:9100  # ug
+          - 100.116.100.32:9100  # eu1
+          - 100.99.30.100:9100   # eu2
+          - 100.82.159.75:9100   # us2
+    relabel_configs:
+      - source_labels: [__address__]
+        regex: "100.74.77.39:.*"
+        target_label: instance
+        replacement: us1
+      - source_labels: [__address__]
+        regex: "100.116.185.70:.*"
+        target_label: instance
+        replacement: ug
+      - source_labels: [__address__]
+        regex: "100.116.100.32:.*"
+        target_label: instance
+        replacement: eu1
+      - source_labels: [__address__]
+        regex: "100.99.30.100:.*"
+        target_label: instance
+        replacement: eu2
+      - source_labels: [__address__]
+        regex: "100.82.159.75:.*"
+        target_label: instance
+        replacement: us2
+
+  - job_name: postgres
+    static_configs:
+      - targets:
+          - 100.74.77.39:9187
+          - 100.116.185.70:9187
+          - 100.116.100.32:9187
+          - 100.99.30.100:9187
+          - 100.82.159.75:9187
+    relabel_configs:
+      - source_labels: [__address__]
+        regex: "100.74.77.39:.*"
+        target_label: instance
+        replacement: us1
+      - source_labels: [__address__]
+        regex: "100.116.185.70:.*"
+        target_label: instance
+        replacement: ug
+      - source_labels: [__address__]
+        regex: "100.116.100.32:.*"
+        target_label: instance
+        replacement: eu1
+      - source_labels: [__address__]
+        regex: "100.99.30.100:.*"
+        target_label: instance
+        replacement: eu2
+      - source_labels: [__address__]
+        regex: "100.82.159.75:.*"
+        target_label: instance
+        replacement: us2
+
+  - job_name: cadvisor
+    static_configs:
+      - targets:
+          - 100.74.77.39:9098
+          - 100.116.185.70:9098
+          - 100.116.100.32:9098
+          - 100.99.30.100:9098
+          - 100.82.159.75:9098
+    relabel_configs:
+      - source_labels: [__address__]
+        regex: "100.74.77.39:.*"
+        target_label: instance
+        replacement: us1
+      - source_labels: [__address__]
+        regex: "100.116.185.70:.*"
+        target_label: instance
+        replacement: ug
+      - source_labels: [__address__]
+        regex: "100.116.100.32:.*"
+        target_label: instance
+        replacement: eu1
+      - source_labels: [__address__]
+        regex: "100.99.30.100:.*"
+        target_label: instance
+        replacement: eu2
+      - source_labels: [__address__]
+        regex: "100.82.159.75:.*"
+        target_label: instance
+        replacement: us2

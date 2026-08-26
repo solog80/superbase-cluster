@@ -1,0 +1,70 @@
+groups:
+  - name: cluster-alerts
+    rules:
+      # ── Node / host down ────────────────────────────────────────────
+      - alert: NodeDown
+        expr: up{job="node"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Node {{ $labels.instance }} is down"
+          description: "Host {{ $labels.instance }} has been unreachable for 2m (node-exporter not scraping)."
+
+      # ── Disk / CPU pressure on any node ─────────────────────────────
+      - alert: DiskHigh
+        expr: (1 - (node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs|autofs"} / node_filesystem_size_bytes{fstype!~"tmpfs|overlay|squashfs|autofs"})) * 100 > 85 and on(mountpoint) node_filesystem_size_bytes{mountpoint!~"/etc/hostname|/etc/hosts|/etc/resolv.conf|/proc.*|/sys.*|/dev.*"} > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Disk >85% on {{ $labels.instance }} ({{ $labels.mountpoint }})"
+
+      # ── Postgres replica lag ────────────────────────────────────────
+      - alert: ReplicaLagHigh
+        expr: pg_replication_lag_seconds > 300
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Replica lag > 5min on {{ $labels.instance }}"
+          description: "Replication lag on {{ $labels.instance }} is {{ $value }}s. Check WAL replay (crash-loop? max_wal_senders mismatch?)."
+
+      # ── Postgres replication slot lost (replica fell behind / WAL purged) ──
+      - alert: ReplicaSlotLost
+        expr: pg_replication_slots_active == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Replication slot {{ $labels.slot_name }} inactive on {{ $labels.instance }}"
+          description: "Slot {{ $labels.slot_name }} has been inactive for 5m. Replica likely needs a re-clone (WAL purged)."
+
+      # ── Postgres down / unresponsive ────────────────────────────────
+      - alert: PostgresDown
+        expr: pg_up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Postgres {{ $labels.instance }} is down"
+
+      # ── Container crash-loop (restarting) ───────────────────────────
+      - alert: ContainerRestarting
+        expr: time() - container_start_time_seconds{name!~"portainer.*"} < 120
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Container {{ $labels.name }} restarting repeatedly on {{ $labels.instance }}"
+          description: "Container {{ $labels.name }} started < 2m ago and has been crash-looping for 10m."
+
+      # ── Realtime / replica crash-loop via slot flapping ─────────────
+      - alert: ReplicaCrashLoop
+        expr: changes(pg_replication_slots_active{slot_name="qnap_replica_slot"}[15m]) > 3
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Replica {{ $labels.instance }} crash-looping (slot {{ $labels.slot_name }} flapping)"
+          description: "Slot {{ $labels.slot_name }} changed state >3 times in 15m — check max_wal_senders config + container health."
