@@ -51,8 +51,13 @@ func (s *server) handleUpdateOnDemandShow(w http.ResponseWriter, r *http.Request
 
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
-	if err := s.restPatch(ctx, "tv_shows", "id=eq."+url.QueryEscape(body.ShowID), row); err != nil {
+	affected, err := s.restPatchCount(ctx, "tv_shows", "id=eq."+url.QueryEscape(body.ShowID), row)
+	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	if affected == 0 {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "no show matched the given id"})
 		return
 	}
 	s.clearOndemandCache()
@@ -242,8 +247,13 @@ func (s *server) handleUpdateOnDemandSeason(w http.ResponseWriter, r *http.Reque
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 	filter := "id=eq." + url.QueryEscape(body.SeasonID) + "&show_id=eq." + url.QueryEscape(body.ShowID)
-	if err := s.restPatch(ctx, "seasons", filter, row); err != nil {
+	affected, err := s.restPatchCount(ctx, "seasons", filter, row)
+	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	if affected == 0 {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "no season matched the given show/season ids"})
 		return
 	}
 	s.clearOndemandCache()
@@ -327,8 +337,15 @@ func (s *server) handleUpdateOnDemandEpisode(w http.ResponseWriter, r *http.Requ
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 	filter := "id=eq." + url.QueryEscape(body.EpisodeID) + "&season_id=eq." + url.QueryEscape(body.SeasonID)
-	if err := s.restPatch(ctx, "episodes", filter, row); err != nil {
+	affected, err := s.restPatchCount(ctx, "episodes", filter, row)
+	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	if affected == 0 {
+		writeJSON(w, http.StatusNotFound, map[string]any{
+			"error": "no episode matched the given show/season/episode ids",
+		})
 		return
 	}
 	s.clearOndemandCache()
