@@ -842,8 +842,27 @@ from srt-node):
   `admin` user is reserved and kept as break-glass; the demo password from first boot
   is superseded — **do not re-use `OPENSEARCH_INITIAL_ADMIN_PASSWORD` in app config**.
 - Build/deploy: `gofn-indexer/README.md` (env vars + examples).
-- **Directus content** (`articles` etc.) is a separate source (Directus SQLite DB), not
-  indexed by this connector yet.
+
+### Joomla articles indexed + `getNewsArticles` ✅
+- **Source:** a small PHP exporter on the Joomla host (`/sfx-articles-export.php`, queries
+  the local MySQL, returns published `state=1` articles as JSON, protected by an
+  `X-Export-Key` header). The indexer pulls it **directly from the origin IP**
+  (`https://65.181.111.128` + `Host: saltmedia.ug`) every 10 min, bypassing Cloudflare —
+  CF serves a JS challenge to datacenter IPs on that path. 5,122 published articles →
+  `saltmedia-joomla_articles` index (title, body(stripped HTML), category, created,
+  publish_up, featured).
+- **Dashboard/app article list fixed:** `getNewsArticles` (Go mesh `/api/v1`) was **never
+  implemented** — the dashboard's `/api/joomla/articles` and the app's mesh path both
+  404'd. Now implemented, backed by OpenSearch, returning the JSON:API shape the
+  dashboard/app already parse: `{ data: [{ type, id, attributes }], meta: { total } }`.
+  Supports `search` (fuzzy title/body), `category`, `featured`, `limit`, `offset`
+  (`state` ignored — all indexed docs are published). Verified: 5,122 list, 68 for
+  `search=tooro`, 131 for `category=Health`, through `edge.solofx.net` for both service
+  key (dashboard) and anon (app).
+- **Cloudflare note:** a WAF custom rule blocks the public export path (`/sfx-articles-export.php`,
+  403 for non-`139.144.77.47`) as defense-in-depth; the indexer uses the direct origin so
+  this doesn't affect it, and no article-viewing path is blocked (verified: Joomla API
+  401=auth-required, article detail 200, homepage 200).
 
 ### Open TODOs
 - [ ] RBAC: scoped roles per index (`saltmedia_*` etc.) instead of admin account; rotate the

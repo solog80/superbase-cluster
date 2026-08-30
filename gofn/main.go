@@ -122,6 +122,10 @@ func (s *server) dispatch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.handleSearchUsers(w, r)
+	case "searchArticles":
+		s.handleSearchArticles(w, r)
+	case "getNewsArticles":
+		s.handleGetNewsArticles(w, r)
 	case "getUsersPaginated":
 		if !s.isServiceKey(r) {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"success": false, "error": "Unauthorized: Admin access required"})
@@ -574,6 +578,234 @@ func (s *server) handleSearchUsers(w http.ResponseWriter, r *http.Request) {
 		"success": true,
 		"data":    map[string]any{"rows": rows, "count": total, "limit": limit, "offset": offset},
 	})
+}
+
+// handleSearchArticles: search Joomla site articles via OpenSearch
+// saltmedia-joomla_articles. Public/anon accessible (articles are public
+// content). Fuzzy multi-field on title/body, optional category filter.
+func (s *server) handleSearchArticles(w http.ResponseWriter, r *http.Request) {
+	qv := r.URL.Query()
+	q := qv.Get("q")
+	cat := qv.Get("category")
+	limit, _ := strconv.Atoi(qv.Get("limit"))
+	offset, _ := strconv.Atoi(qv.Get("offset"))
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	if s.osClient == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"success": false, "error": "search unavailable"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	rows, total, err := s.osSearchArticles(ctx, q, cat, limit, offset)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"success": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"success": true,
+		"data":    map[string]any{"rows": rows, "count": total, "limit": limit, "offset": offset},
+	})
+}
+
+// osSearchArticles queries OpenSearch saltmedia-joomla_articles.
+func (s *server) osSearchArticles(ctx context.Context, q, cat string, limit, offset int) ([]map[string]any, int, error) {
+	var query map[string]any
+	switch {
+	case q != "" && cat != "":
+		query = map[string]any{
+			"bool": map[string]any{
+				"must": []any{
+					map[string]any{"multi_match": map[string]any{"query": q, "fields": []string{"title", "body"}, "fuzziness": "AUTO"}},
+				},
+				"filter": []any{
+					map[string]any{"term": map[string]any{"category": cat}},
+				},
+			},
+		}
+	case q != "":
+		query = map[string]any{
+			"multi_match": map[string]any{"query": q, "fields": []string{"title", "body"}, "fuzziness": "AUTO"},
+		}
+	case cat != "":
+		query = map[string]any{"term": map[string]any{"category": cat}}
+	default:
+		query = map[string]any{"match_all": map[string]any{}}
+	}
+	body, _ := json.Marshal(map[string]any{
+		"query": query,
+		"from":  offset,
+		"size":  limit,
+		"sort":  []any{map[string]any{"_score": "desc"}},
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.osURL+"/saltmedia-joomla_articles/_search", bytes.NewReader(body))
+	if err != nil {
+		return nil, 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.SetBasicAuth(s.osUser, s.osPass)
+	resp, err := s.osClient.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 300 {
+		return nil, 0, fmt.Errorf("os HTTP %d", resp.StatusCode)
+	}
+	var out struct {
+		Hits struct {
+			Total struct {
+				Value int `json:"value"`
+			} `json:"total"`
+			Hits []struct {
+				Source map[string]any `json:"_source"`
+			} `json:"hits"`
+		} `json:"hits"`
+	}
+	if err := json.Unmarshal(respBody, &out); err != nil {
+		return nil, 0, err
+	}
+	rows := make([]map[string]any, 0, len(out.Hits.Hits))
+	for _, h := range out.Hits.Hits {
+		rows = append(rows, h.Source)
+	}
+	return rows, out.Hits.Total.Value, nil
+}
+
+// handleGetNewsArticles: Joomla article list for the dashboard + app.
+// Backed by OpenSearch saltmedia-joomla_articles; returns the JSON:API shape
+// the dashboard/app already parse: { data: [{ type, id, attributes }], meta }.
+// Supports search, category, state, featured, author, limit, offset.
+func (s *server) handleGetNewsArticles(w http.ResponseWriter, r *http.Request) {
+	qv := r.URL.Query()
+	search := qv.Get("search")
+	cat := qv.Get("category")
+	state := qv.Get("state")
+	featured := qv.Get("featured")
+	author := qv.Get("author")
+	limit, _ := strconv.Atoi(qv.Get("limit"))
+	offset, _ := strconv.Atoi(qv.Get("offset"))
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	if s.osClient == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "search unavailable"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	rows, total, err := s.osGetNewsArticles(ctx, search, cat, state, featured, author, limit, offset)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
+		return
+	}
+	// Convert OpenSearch sources to the JSON:API article shape.
+	data := make([]map[string]any, 0, len(rows))
+	for _, src := range rows {
+		attrs := map[string]any{
+			"id":         src["id"],
+			"title":      src["title"],
+			"alias":      src["alias"],
+			"created":    src["created"],
+			"publish_up": src["publish_up"],
+			"featured":   src["featured"],
+			"category":   src["category"],
+			"text":       src["body"],
+		}
+		data = append(data, map[string]any{
+			"type":       "articles",
+			"id":         fmt.Sprint(src["id"]),
+			"attributes": attrs,
+			"relationships": map[string]any{
+				"category": map[string]any{"data": map[string]any{"type": "categories", "id": src["category"]}},
+			},
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"data": data,
+		"meta": map[string]any{"total": total, "limit": limit, "offset": offset},
+	})
+}
+
+// osGetNewsArticles queries OpenSearch saltmedia-joomla_articles for the
+// news list. Builds a bool query from the optional filters.
+func (s *server) osGetNewsArticles(ctx context.Context, search, cat, state, featured, author string, limit, offset int) ([]map[string]any, int, error) {
+	var must []any
+	var filter []any
+	if search != "" {
+		must = append(must, map[string]any{
+			"multi_match": map[string]any{"query": search, "fields": []string{"title", "body"}, "fuzziness": "AUTO"},
+		})
+	}
+	if cat != "" {
+		filter = append(filter, map[string]any{"term": map[string]any{"category": cat}})
+	}
+	// NOTE: indexed docs are already state=1 (published only, from the export),
+	// so the state param is ignored. featured is a boolean field.
+	if featured != "" {
+		filter = append(filter, map[string]any{"term": map[string]any{"featured": featured == "1" || featured == "true"}})
+	}
+	var query map[string]any
+	switch {
+	case len(must) > 0 || len(filter) > 0:
+		q := map[string]any{}
+		if len(must) > 0 {
+			q["must"] = must
+		}
+		if len(filter) > 0 {
+			q["filter"] = filter
+		}
+		query = map[string]any{"bool": q}
+	default:
+		query = map[string]any{"match_all": map[string]any{}}
+	}
+	body, _ := json.Marshal(map[string]any{
+		"query": query,
+		"from":  offset,
+		"size":  limit,
+		"sort":  []any{map[string]any{"_score": "desc"}},
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.osURL+"/saltmedia-joomla_articles/_search", bytes.NewReader(body))
+	if err != nil {
+		return nil, 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.SetBasicAuth(s.osUser, s.osPass)
+	resp, err := s.osClient.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 300 {
+		return nil, 0, fmt.Errorf("os HTTP %d", resp.StatusCode)
+	}
+	var out struct {
+		Hits struct {
+			Total struct {
+				Value int `json:"value"`
+			} `json:"total"`
+			Hits []struct {
+				Source map[string]any `json:"_source"`
+			} `json:"hits"`
+		} `json:"hits"`
+	}
+	if err := json.Unmarshal(respBody, &out); err != nil {
+		return nil, 0, err
+	}
+	rows := make([]map[string]any, 0, len(out.Hits.Hits))
+	for _, h := range out.Hits.Hits {
+		rows = append(rows, h.Source)
+	}
+	return rows, out.Hits.Total.Value, nil
 }
 
 // osSearchUsers queries OpenSearch saltmedia-users with fuzzy multi-field

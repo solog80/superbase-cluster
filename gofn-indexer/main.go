@@ -54,6 +54,10 @@ type indexer struct {
 	prefix   string
 	replicas []string
 	anonKey  string
+
+	joomlaURL string // Joomla article export endpoint
+	joomlaKey string // X-Export-Key header value
+	insecure  bool   // skip TLS verify (self-signed/expired origin certs)
 }
 
 // indexDef describes one searchable collection.
@@ -122,13 +126,16 @@ func newIndexer() *indexer {
 		replicas = []string{"http://100.82.159.75:5557"} // default: us2 bare-path replica
 	}
 	ix := &indexer{
-		osURL:    strings.TrimSuffix(os.Getenv("OPENSEARCH_URL"), "/"),
-		osUser:   getenv("OPENSEARCH_USER", "admin"),
-		osPass:   os.Getenv("OPENSEARCH_PASSWORD"),
-		client:   &http.Client{Transport: tr, Timeout: 15 * time.Second},
-		prefix:   getenv("INDEX_PREFIX", "saltmedia"),
-		replicas: replicas,
-		anonKey:  os.Getenv("ANON_KEY"),
+		osURL:     strings.TrimSuffix(os.Getenv("OPENSEARCH_URL"), "/"),
+		osUser:    getenv("OPENSEARCH_USER", "admin"),
+		osPass:    os.Getenv("OPENSEARCH_PASSWORD"),
+		client:    &http.Client{Transport: tr, Timeout: 15 * time.Second},
+		prefix:    getenv("INDEX_PREFIX", "saltmedia"),
+		replicas:  replicas,
+		anonKey:   os.Getenv("ANON_KEY"),
+		joomlaURL: strings.TrimSuffix(os.Getenv("JOOMLA_EXPORT_URL"), "/"),
+		joomlaKey: os.Getenv("JOOMLA_EXPORT_KEY"),
+		insecure:  os.Getenv("OPENSEARCH_INSECURE") == "1",
 	}
 	if ix.osURL == "" {
 		log.Fatal("OPENSEARCH_URL required")
@@ -238,8 +245,66 @@ func (ix *indexer) runFull(ctx context.Context) error {
 		total += len(rows)
 		log.Printf("  indexed %s (%d docs)", idx, len(rows))
 	}
+
+	// Joomla articles (site content) — separate HTTP source.
+	if ix.joomlaURL != "" {
+		n, err := ix.indexJoomla(ctx)
+		if err != nil {
+			return fmt.Errorf("joomla: %w", err)
+		}
+		total += n
+	}
+
 	log.Printf("FULL INDEX OK: %d docs across %d indices in %s", total, len(indices), time.Since(start).Round(time.Millisecond))
 	return nil
+}
+
+// indexJoomla pulls the Joomla article export (HTTP JSON) and bulk-loads it
+// into <prefix>-joomla_articles. Indexes title/body/category for search.
+func (ix *indexer) indexJoomla(ctx context.Context) (int, error) {
+	idx := ix.prefix + "-joomla_articles"
+
+	// Longer timeout + TLS-skip for the (potentially ~14 MB) export from the
+	// Joomla origin IP (cert is for the domain, not the raw IP).
+	tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: ix.insecure}}
+	jc := &http.Client{Transport: tr, Timeout: 60 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ix.joomlaURL, nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("X-Export-Key", ix.joomlaKey)
+	// The origin is a shared virtual host; set the correct Host header so the
+	// request routes to the Joomla vhost (configurable via JOOMLA_EXPORT_HOST).
+	if h := os.Getenv("JOOMLA_EXPORT_HOST"); h != "" {
+		req.Host = h
+	}
+	resp, err := jc.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return 0, fmt.Errorf("joomla export HTTP %d", resp.StatusCode)
+	}
+	var out struct {
+		Count    int              `json:"count"`
+		Articles []map[string]any `json:"articles"`
+	}
+	dec := json.NewDecoder(io.LimitReader(resp.Body, 64<<20))
+	if err := dec.Decode(&out); err != nil {
+		return 0, err
+	}
+
+	rows := make([]json.RawMessage, 0, len(out.Articles))
+	for _, a := range out.Articles {
+		b, _ := json.Marshal(a)
+		rows = append(rows, b)
+	}
+	if err := ix.rebuildIndex(ctx, idx, rows); err != nil {
+		return 0, err
+	}
+	log.Printf("  indexed %s (%d docs)", idx, len(rows))
+	return len(rows), nil
 }
 
 // rebuildIndex deletes + recreates the index and bulk-loads docs.
@@ -256,7 +321,7 @@ func (ix *indexer) rebuildIndex(ctx context.Context, index string, rows []json.R
 	// 404 = fine (no index yet). Other errors logged but we continue to create.
 
 	// Create index (idempotent).
-	mapping := fmt.Sprintf(`{"settings":{"number_of_shards":1,"number_of_replicas":0},"mappings":{"properties":{"title":{"type":"text"},"program_name":{"type":"text"},"description":{"type":"text"},"genre":{"type":"keyword"},"type":{"type":"keyword"},"station_id":{"type":"keyword"},"published":{"type":"boolean"},"name":{"type":"text"},"email":{"type":"keyword"},"user_name":{"type":"text"},"role":{"type":"keyword"},"is_admin":{"type":"boolean"},"is_blocked":{"type":"boolean"}}}}`)
+	mapping := fmt.Sprintf(`{"settings":{"number_of_shards":1,"number_of_replicas":0},"mappings":{"properties":{"title":{"type":"text"},"program_name":{"type":"text"},"description":{"type":"text"},"genre":{"type":"keyword"},"type":{"type":"keyword"},"station_id":{"type":"keyword"},"published":{"type":"boolean"},"name":{"type":"text"},"email":{"type":"keyword"},"user_name":{"type":"text"},"role":{"type":"keyword"},"is_admin":{"type":"boolean"},"is_blocked":{"type":"boolean"},"body":{"type":"text"},"category":{"type":"keyword"},"featured":{"type":"boolean"}}}}`)
 	creq, _ := http.NewRequestWithContext(ctx, http.MethodPut, fmt.Sprintf("%s/%s", ix.osURL, index), bytes.NewBufferString(mapping))
 	creq.Header.Set("Content-Type", "application/json")
 	ix.setAuth(creq)
