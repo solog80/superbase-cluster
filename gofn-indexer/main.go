@@ -55,9 +55,9 @@ type indexer struct {
 	replicas []string
 	anonKey  string
 
-	joomlaURL string // Joomla article export endpoint
-	joomlaKey string // X-Export-Key header value
-	insecure  bool   // skip TLS verify (self-signed/expired origin certs)
+	meshBase string // mesh base URL for the Joomla article feed (e.g. https://edge.solofx.net)
+	meshKey  string // mesh service key for the feed call
+	insecure bool   // skip TLS verify (self-signed/expired origin certs)
 }
 
 // indexDef describes one searchable collection.
@@ -126,16 +126,16 @@ func newIndexer() *indexer {
 		replicas = []string{"http://100.82.159.75:5557"} // default: us2 bare-path replica
 	}
 	ix := &indexer{
-		osURL:     strings.TrimSuffix(os.Getenv("OPENSEARCH_URL"), "/"),
-		osUser:    getenv("OPENSEARCH_USER", "admin"),
-		osPass:    os.Getenv("OPENSEARCH_PASSWORD"),
-		client:    &http.Client{Transport: tr, Timeout: 15 * time.Second},
-		prefix:    getenv("INDEX_PREFIX", "saltmedia"),
-		replicas:  replicas,
-		anonKey:   os.Getenv("ANON_KEY"),
-		joomlaURL: strings.TrimSuffix(os.Getenv("JOOMLA_EXPORT_URL"), "/"),
-		joomlaKey: os.Getenv("JOOMLA_EXPORT_KEY"),
-		insecure:  os.Getenv("OPENSEARCH_INSECURE") == "1",
+		osURL:    strings.TrimSuffix(os.Getenv("OPENSEARCH_URL"), "/"),
+		osUser:   getenv("OPENSEARCH_USER", "admin"),
+		osPass:   os.Getenv("OPENSEARCH_PASSWORD"),
+		client:   &http.Client{Transport: tr, Timeout: 15 * time.Second},
+		prefix:   getenv("INDEX_PREFIX", "saltmedia"),
+		replicas: replicas,
+		anonKey:  os.Getenv("ANON_KEY"),
+		meshBase: strings.TrimSuffix(os.Getenv("MESH_BASE_URL"), "/"),
+		meshKey:  os.Getenv("MESH_SERVICE_KEY"),
+		insecure: os.Getenv("OPENSEARCH_INSECURE") == "1",
 	}
 	if ix.osURL == "" {
 		log.Fatal("OPENSEARCH_URL required")
@@ -246,8 +246,8 @@ func (ix *indexer) runFull(ctx context.Context) error {
 		log.Printf("  indexed %s (%d docs)", idx, len(rows))
 	}
 
-	// Joomla articles (site content) — separate HTTP source.
-	if ix.joomlaURL != "" {
+	// Joomla articles (site content) — pulled via the mesh (Joomla API proxy).
+	if ix.meshBase != "" {
 		n, err := ix.indexJoomla(ctx)
 		if err != nil {
 			return fmt.Errorf("joomla: %w", err)
@@ -259,52 +259,104 @@ func (ix *indexer) runFull(ctx context.Context) error {
 	return nil
 }
 
-// indexJoomla pulls the Joomla article export (HTTP JSON) and bulk-loads it
-// into <prefix>-joomla_articles. Indexes title/body/category for search.
+// indexJoomla pulls Joomla articles from the MESH getNewsArticles endpoint
+// (which proxies the Joomla API from Edge — the reliable path) and bulk-loads
+// them into <prefix>-joomla_articles. Paginates page[limit]=500.
+//
+// This keeps a SINGLE source of truth: the Joomla API (same source the
+// dashboard reads/writes), not a separate MySQL export.
 func (ix *indexer) indexJoomla(ctx context.Context) (int, error) {
 	idx := ix.prefix + "-joomla_articles"
 
-	// Longer timeout + TLS-skip for the (potentially ~14 MB) export from the
-	// Joomla origin IP (cert is for the domain, not the raw IP).
-	tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: ix.insecure}}
-	jc := &http.Client{Transport: tr, Timeout: 60 * time.Second}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ix.joomlaURL, nil)
-	if err != nil {
-		return 0, err
-	}
-	req.Header.Set("X-Export-Key", ix.joomlaKey)
-	// The origin is a shared virtual host; set the correct Host header so the
-	// request routes to the Joomla vhost (configurable via JOOMLA_EXPORT_HOST).
-	if h := os.Getenv("JOOMLA_EXPORT_HOST"); h != "" {
-		req.Host = h
-	}
-	resp, err := jc.Do(req)
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return 0, fmt.Errorf("joomla export HTTP %d", resp.StatusCode)
-	}
-	var out struct {
-		Count    int              `json:"count"`
-		Articles []map[string]any `json:"articles"`
-	}
-	dec := json.NewDecoder(io.LimitReader(resp.Body, 64<<20))
-	if err := dec.Decode(&out); err != nil {
-		return 0, err
+	jc := &http.Client{Timeout: 120 * time.Second}
+	var rows []json.RawMessage
+	offset := 0
+	const pageSize = 500
+	for {
+		u := fmt.Sprintf("%s/api/v1/getNewsArticles?limit=%d&offset=%d&state=1", ix.meshBase, pageSize, offset)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		if err != nil {
+			return 0, err
+		}
+		req.Header.Set("apikey", ix.meshKey)
+		req.Header.Set("Authorization", "Bearer "+ix.meshKey)
+		resp, err := jc.Do(req)
+		if err != nil {
+			return 0, err
+		}
+		var out struct {
+			Data []map[string]any `json:"data"`
+		}
+		dec := json.NewDecoder(io.LimitReader(resp.Body, 64<<20))
+		derr := dec.Decode(&out)
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			return 0, fmt.Errorf("mesh getNewsArticles HTTP %d", resp.StatusCode)
+		}
+		if derr != nil {
+			return 0, derr
+		}
+		if len(out.Data) == 0 {
+			break
+		}
+		for _, item := range out.Data {
+			// JSON:API item -> flat OpenSearch doc.
+			attrs, _ := item["attributes"].(map[string]any)
+			// Joomla returns 0/1 for featured/state; coerce to bool for the
+			// OpenSearch boolean mapping.
+			featured := toBool(attrs["featured"])
+			doc := map[string]any{
+				"id":         attrs["id"],
+				"title":      attrs["title"],
+				"alias":      attrs["alias"],
+				"category":   joomlaCategory(item),
+				"created":    attrs["created"],
+				"publish_up": attrs["publish_up"],
+				"state":      attrs["state"],
+				"hits":       attrs["hits"],
+				"featured":   featured,
+				"created_by": attrs["created_by"],
+				"images":     attrs["images"],
+				"metadesc":   attrs["metadesc"],
+				"body":       attrs["text"],
+			}
+			b, _ := json.Marshal(doc)
+			rows = append(rows, b)
+		}
+		offset += len(out.Data)
+		if len(out.Data) < pageSize {
+			break
+		}
 	}
 
-	rows := make([]json.RawMessage, 0, len(out.Articles))
-	for _, a := range out.Articles {
-		b, _ := json.Marshal(a)
-		rows = append(rows, b)
-	}
 	if err := ix.rebuildIndex(ctx, idx, rows); err != nil {
 		return 0, err
 	}
 	log.Printf("  indexed %s (%d docs)", idx, len(rows))
 	return len(rows), nil
+}
+
+// joomlaCategory extracts the category from a JSON:API item's relationships
+// (may be missing in list responses; falls back to empty).
+func joomlaCategory(item map[string]any) string {
+	rel, _ := item["relationships"].(map[string]any)
+	cat, _ := rel["category"].(map[string]any)
+	data, _ := cat["data"].(map[string]any)
+	id, _ := data["id"].(string)
+	return id
+}
+
+// toBool coerces Joomla's 0/1/"0"/"1"/bool into a Go bool for OpenSearch.
+func toBool(v any) bool {
+	switch t := v.(type) {
+	case bool:
+		return t
+	case float64:
+		return t != 0
+	case string:
+		return t == "1" || t == "true"
+	}
+	return false
 }
 
 // rebuildIndex deletes + recreates the index and bulk-loads docs.

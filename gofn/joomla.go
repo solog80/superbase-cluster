@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -80,13 +82,58 @@ func (j *joomlaClient) request(ctx context.Context, method, path string, params 
 }
 
 // handleGetNewsArticles: Joomla article list (JSON:API passthrough).
+// When a `search` term is present, queries OpenSearch (fuzzy, fast) and maps
+// results back to the JSON:API shape the dashboard parses. Otherwise proxies
+// the Joomla API (list/pagination). Falls back to the Joomla API if OpenSearch
+// is unavailable.
 func (s *server) handleGetNewsArticles(w http.ResponseWriter, r *http.Request) {
+	qv := r.URL.Query()
+	limit, _ := strconv.Atoi(qv.Get("limit"))
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	offset, _ := strconv.Atoi(qv.Get("offset"))
+	if offset < 0 {
+		offset = 0
+	}
+
+	// Search path: OpenSearch fuzzy on title/body/category.
+	if qv.Get("search") != "" && s.osClient != nil {
+		rows, total, err := s.osSearchNewsArticles(r.Context(), qv.Get("search"), qv.Get("category"), limit, offset)
+		if err == nil {
+			data := make([]map[string]any, 0, len(rows))
+			for _, src := range rows {
+				data = append(data, map[string]any{
+					"type": "articles",
+					"id":   fmt.Sprint(src["id"]),
+					"attributes": map[string]any{
+						"id":         src["id"],
+						"title":      src["title"],
+						"alias":      src["alias"],
+						"state":      src["state"],
+						"hits":       src["hits"],
+						"featured":   src["featured"],
+						"created":    src["created"],
+						"publish_up": src["publish_up"],
+						"images":     src["images"],
+						"text":       src["body"],
+					},
+					"relationships": map[string]any{
+						"category": map[string]any{"data": map[string]any{"type": "categories", "id": src["category"]}},
+					},
+				})
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"data": data, "meta": map[string]any{"total": total, "limit": limit, "offset": offset}})
+			return
+		}
+		log.Printf("opensearch news search failed (%v); falling back to Joomla API", err)
+	}
+
 	j := newJoomlaClient()
 	if j.username == "" {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "joomla api not configured"})
 		return
 	}
-	qv := r.URL.Query()
 	params := url.Values{}
 	params.Set("page[limit]", firstNonEmpty(qv.Get("limit"), "20"))
 	params.Set("page[offset]", firstNonEmpty(qv.Get("offset"), "0"))
@@ -119,6 +166,66 @@ func (s *server) handleGetNewsArticles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeRawJSON(w, status, body)
+}
+
+// osSearchNewsArticles queries OpenSearch saltmedia-joomla_articles for the
+// news dashboard search (fuzzy multi-field on title/body, optional category).
+func (s *server) osSearchNewsArticles(ctx context.Context, q, cat string, limit, offset int) ([]map[string]any, int, error) {
+	var query map[string]any
+	if cat != "" {
+		query = map[string]any{
+			"bool": map[string]any{
+				"must": []any{
+					map[string]any{"multi_match": map[string]any{"query": q, "fields": []string{"title", "body"}, "fuzziness": "AUTO"}},
+				},
+				"filter": []any{
+					map[string]any{"term": map[string]any{"category": cat}},
+				},
+			},
+		}
+	} else {
+		query = map[string]any{
+			"multi_match": map[string]any{"query": q, "fields": []string{"title", "body"}, "fuzziness": "AUTO"},
+		}
+	}
+	body, _ := json.Marshal(map[string]any{
+		"query": query,
+		"from":  offset,
+		"size":  limit,
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.osURL+"/saltmedia-joomla_articles/_search", strings.NewReader(string(body)))
+	if err != nil {
+		return nil, 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.SetBasicAuth(s.osUser, s.osPass)
+	resp, err := s.osClient.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 300 {
+		return nil, 0, fmt.Errorf("os HTTP %d", resp.StatusCode)
+	}
+	var out struct {
+		Hits struct {
+			Total struct {
+				Value int `json:"value"`
+			} `json:"total"`
+			Hits []struct {
+				Source map[string]any `json:"_source"`
+			} `json:"hits"`
+		} `json:"hits"`
+	}
+	if err := json.Unmarshal(respBody, &out); err != nil {
+		return nil, 0, err
+	}
+	rows := make([]map[string]any, 0, len(out.Hits.Hits))
+	for _, h := range out.Hits.Hits {
+		rows = append(rows, h.Source)
+	}
+	return rows, out.Hits.Total.Value, nil
 }
 
 // handleGetNewsArticle: single article (JSON:API passthrough).

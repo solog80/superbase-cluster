@@ -872,6 +872,25 @@ from srt-node):
 - **Verified through `edge.solofx.net`:** articles list (state/hits/author/thumbnails),
   single article, categories (21), authors (33) all return correct Joomla JSON:API.
 
+### News dashboard search = OpenSearch (fuzzy), indexed via the Joomla API ✅
+- **Indexer pulls from the Joomla API (not a MySQL export)** for consistency: the indexer
+  calls the mesh `getNewsArticles` endpoint (which proxies the Joomla API from Edge) in
+  pages of 500 → `saltmedia-joomla_articles`. Single source of truth = the same API the
+  dashboard reads/writes. 2,024 API-visible published articles indexed (matches the
+  dashboard exactly; the API exposes fewer than the raw 5,122 DB rows due to its own
+  filtering).
+- **Search wiring:** `getNewsArticles?search=X` now queries **OpenSearch first** (fuzzy
+  multi-field on title/body, optional category filter), mapping results back to the
+  JSON:API shape the dashboard parses (titles, thumbnails, state, hits, category).
+  **Falls back to the Joomla API** if OpenSearch is unavailable (verified live).
+  List/pagination (no search term) still proxies the Joomla API unchanged.
+- **Verified:** typo `sironk` → finds "Sironko Leaders…", `tooro` → 3 results with
+  thumbnails, ~1.0-1.5s (faster than the ~3s Joomla API search), fallback works when
+  OpenSearch is stopped. No dashboard code change needed (it calls `getNewsArticles?search=`).
+- Indexer config: `MESH_BASE_URL` + `MESH_SERVICE_KEY` (replaces the old export-endpoint
+  env). The PHP export endpoint (`/sfx-articles-export.php`) is retained but no longer used
+  by the indexer; its CF block rule remains harmless.
+
 ### Open TODOs
 - [ ] RBAC: scoped roles per index (`saltmedia_*` etc.) instead of admin account; rotate the
       initial admin password.
