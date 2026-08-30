@@ -1,6 +1,9 @@
 # Built artifacts
 gofn/salt-gofn
+gofn/salt-gofn-linux
 *.exe
+gofn-indexer/salt-gofn-indexer-linux
+gofn-indexer/salt-gofn-indexer
 
 # Local env / secrets
 .env

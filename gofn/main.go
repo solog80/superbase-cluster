@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,9 +24,16 @@ type server struct {
 	anonKey    string
 	client     *http.Client
 
+	// Optional OpenSearch-backed search (set via OPENSEARCH_URL).
+	osURL      string
+	osUser     string
+	osPass     string
+	osInsecure bool
+	osClient   *http.Client
+
 	tsdb *tsdbConn
 
-	adsMu   sync.Mutex
+	adsMu    sync.Mutex
 	adsCache map[string]adsCacheEntry
 
 	rpcMu    sync.Mutex
@@ -55,11 +64,20 @@ func main() {
 		serviceKey: os.Getenv("SERVICE_ROLE_KEY"),
 		anonKey:    os.Getenv("ANON_KEY"),
 		client:     &http.Client{Timeout: 10 * time.Second},
+		osURL:      strings.TrimSuffix(os.Getenv("OPENSEARCH_URL"), "/"),
+		osUser:     getenv("OPENSEARCH_USER", "admin"),
+		osPass:     os.Getenv("OPENSEARCH_PASSWORD"),
+		osInsecure: os.Getenv("OPENSEARCH_INSECURE") == "1",
 		tsdb:       tsdb,
 		adsCache:   map[string]adsCacheEntry{},
 		rpcCache:   map[string]rpcCacheEntry{},
 		epgCache:   map[string]epgCacheEntry{},
 		odCache:    nil,
+	}
+	if s.osURL != "" {
+		tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: s.osInsecure}}
+		s.osClient = &http.Client{Transport: tr, Timeout: 5 * time.Second}
+		log.Printf("opensearch search enabled: %s", s.osURL)
 	}
 
 	mux := http.NewServeMux()
@@ -98,6 +116,18 @@ func (s *server) dispatch(w http.ResponseWriter, r *http.Request) {
 		s.handleGetApiConfig(w, r)
 	case "catalog":
 		s.handleCatalog(w, r)
+	case "searchUsers":
+		if !s.isServiceKey(r) {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"success": false, "error": "Unauthorized: Admin access required"})
+			return
+		}
+		s.handleSearchUsers(w, r)
+	case "getUsersPaginated":
+		if !s.isServiceKey(r) {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"success": false, "error": "Unauthorized: Admin access required"})
+			return
+		}
+		s.handleGetUsersPaginated(w, r)
 	case "getAdMobile":
 		s.handleGetAdMobile(w, r)
 	case "batchTrackAdEvents":
@@ -331,6 +361,20 @@ func (s *server) handleCatalog(w http.ResponseWriter, r *http.Request) {
 		p.Limit = 100
 	}
 
+	// Search via OpenSearch when configured (replica-indexed catalog). Fall
+	// back to PostgREST ilike if OpenSearch is unreachable.
+	if s.osClient != nil {
+		rows, count, err := s.osSearchCatalog(r.Context(), p)
+		if err == nil {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"success": true,
+				"data":    map[string]any{"rows": rows, "count": count, "limit": p.Limit, "offset": p.Offset, "search": "opensearch"},
+			})
+			return
+		}
+		log.Printf("opensearch catalog search failed (%v); falling back to PostgREST", err)
+	}
+
 	vals := url.Values{
 		"select": {"id,title,type,description,published,season_count,poster_url_16x9"},
 	}
@@ -363,8 +407,228 @@ func (s *server) handleCatalog(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"success": true,
-		"data":    map[string]any{"rows": rows, "count": total, "limit": p.Limit, "offset": p.Offset},
+		"data":    map[string]any{"rows": rows, "count": total, "limit": p.Limit, "offset": p.Offset, "search": "postgrest"},
 	})
+}
+
+// osSearchCatalog queries OpenSearch (saltmedia-tv_shows) with fuzzy
+// multi-field matching and returns the result rows plus total count.
+func (s *server) osSearchCatalog(ctx context.Context, p catalogParams) ([]map[string]any, int, error) {
+	var query map[string]any
+	switch {
+	case p.Q != "" && p.Type != "":
+		query = map[string]any{
+			"bool": map[string]any{
+				"must": []any{
+					map[string]any{"multi_match": map[string]any{"query": p.Q, "fields": []string{"title", "description"}, "fuzziness": "AUTO"}},
+				},
+				"filter": []any{
+					map[string]any{"term": map[string]any{"type": p.Type}},
+				},
+			},
+		}
+	case p.Q != "":
+		query = map[string]any{
+			"multi_match": map[string]any{"query": p.Q, "fields": []string{"title", "description"}, "fuzziness": "AUTO"},
+		}
+	case p.Type != "":
+		query = map[string]any{"term": map[string]any{"type": p.Type}}
+	default:
+		query = map[string]any{"match_all": map[string]any{}}
+	}
+	body, _ := json.Marshal(map[string]any{
+		"query": query,
+		"from":  p.Offset,
+		"size":  p.Limit,
+		"sort":  []any{map[string]any{"_score": "desc"}},
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.osURL+"/saltmedia-tv_shows/_search", bytes.NewReader(body))
+	if err != nil {
+		return nil, 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.SetBasicAuth(s.osUser, s.osPass)
+	resp, err := s.osClient.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 300 {
+		return nil, 0, fmt.Errorf("os HTTP %d", resp.StatusCode)
+	}
+	var out struct {
+		Hits struct {
+			Total struct {
+				Value int `json:"value"`
+			} `json:"total"`
+			Hits []struct {
+				Source map[string]any `json:"_source"`
+			} `json:"hits"`
+		} `json:"hits"`
+	}
+	if err := json.Unmarshal(respBody, &out); err != nil {
+		return nil, 0, err
+	}
+	rows := make([]map[string]any, 0, len(out.Hits.Hits))
+	for _, h := range out.Hits.Hits {
+		rows = append(rows, h.Source)
+	}
+	return rows, out.Hits.Total.Value, nil
+}
+
+// handleGetUsersPaginated: admin user list with optional search.
+// Backed by OpenSearch (fuzzy) when a searchTerm is given, otherwise paged
+// PostgREST. Response shape matches the admin dashboard's
+// GetUsersPaginatedResponse: { users, total, page, limit, nextPageToken }.
+func (s *server) handleGetUsersPaginated(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	term := q.Get("searchTerm")
+	hasEmail := q.Get("hasEmail")
+	page, _ := strconv.Atoi(q.Get("page"))
+	limit, _ := strconv.Atoi(q.Get("limit"))
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	if page < 1 {
+		page = 1
+	}
+	offset := (page - 1) * limit
+
+	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+	defer cancel()
+
+	write := func(users []map[string]any, total int) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"users": users, "total": total, "page": page, "limit": limit,
+			"nextPageToken": nil,
+		})
+	}
+
+	// Search path: OpenSearch fuzzy on name/email/user_name.
+	if term != "" && s.osClient != nil {
+		rows, total, err := s.osSearchUsers(ctx, term, limit, offset)
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
+			return
+		}
+		write(rows, total)
+		return
+	}
+
+	// No search: page via PostgREST (service role).
+	vals := url.Values{}
+	vals.Set("select", "id,name,email,user_name,role,is_admin,is_blocked,is_verified,is_anonymous,profile_image_url,created_at")
+	if hasEmail == "true" {
+		vals.Set("email", "not.is.null")
+	} else if hasEmail == "false" {
+		vals.Set("email", "is.null")
+	}
+	vals.Set("order", "created_at.desc")
+	vals.Set("limit", strconv.Itoa(limit))
+	vals.Set("offset", strconv.Itoa(offset))
+
+	body, hdr, err := s.doRest(ctx, "users", vals)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	var rows []map[string]any
+	if err := json.Unmarshal(body, &rows); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "bad response: " + err.Error()})
+		return
+	}
+	total := len(rows)
+	var cr int
+	if _, serr := fmt.Sscanf(hdr.Get("Content-Range"), "0-0/%d", &cr); serr == nil {
+		total = cr
+	}
+	write(rows, total)
+}
+
+// handleSearchUsers: admin user search backed by OpenSearch saltmedia-users.
+// Requires the service-role key (admin dashboard uses /api/v1).
+func (s *server) handleSearchUsers(w http.ResponseWriter, r *http.Request) {
+	qv := r.URL.Query()
+	term := qv.Get("q")
+	limit, _ := strconv.Atoi(qv.Get("limit"))
+	offset, _ := strconv.Atoi(qv.Get("offset"))
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	if s.osClient == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"success": false, "error": "search unavailable"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	rows, total, err := s.osSearchUsers(ctx, term, limit, offset)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"success": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"success": true,
+		"data":    map[string]any{"rows": rows, "count": total, "limit": limit, "offset": offset},
+	})
+}
+
+// osSearchUsers queries OpenSearch saltmedia-users with fuzzy multi-field
+// matching on name/email/user_name.
+func (s *server) osSearchUsers(ctx context.Context, q string, limit, offset int) ([]map[string]any, int, error) {
+	var query map[string]any
+	if q == "" {
+		query = map[string]any{"match_all": map[string]any{}}
+	} else {
+		query = map[string]any{
+			"multi_match": map[string]any{
+				"query":     q,
+				"fields":    []string{"name", "email", "user_name"},
+				"fuzziness": "AUTO",
+			},
+		}
+	}
+	body, _ := json.Marshal(map[string]any{
+		"query": query,
+		"from":  offset,
+		"size":  limit,
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.osURL+"/saltmedia-users/_search", bytes.NewReader(body))
+	if err != nil {
+		return nil, 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.SetBasicAuth(s.osUser, s.osPass)
+	resp, err := s.osClient.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 300 {
+		return nil, 0, fmt.Errorf("os HTTP %d", resp.StatusCode)
+	}
+	var out struct {
+		Hits struct {
+			Total struct {
+				Value int `json:"value"`
+			} `json:"total"`
+			Hits []struct {
+				Source map[string]any `json:"_source"`
+			} `json:"hits"`
+		} `json:"hits"`
+	}
+	if err := json.Unmarshal(respBody, &out); err != nil {
+		return nil, 0, err
+	}
+	rows := make([]map[string]any, 0, len(out.Hits.Hits))
+	for _, h := range out.Hits.Hits {
+		rows = append(rows, h.Source)
+	}
+	return rows, out.Hits.Total.Value, nil
 }
 
 func (s *server) doRest(ctx context.Context, path string, values url.Values) ([]byte, http.Header, error) {

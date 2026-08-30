@@ -49,6 +49,7 @@ firewall holes, no public exposure of Postgres.
 | **App read path** | ✅ **moved to `/rest/v1` RPCs** (CDN-cached + geo-routed) — see §2.5 |
 | **Cross-region failover** | ✅ **cascading priorities** in envoy geo clusters — see §2.6 |
 | **SFX video delivery** | ✅ **signing on the Go mesh + CF edge cache** for `objects.solofx.net` — see §15 |
+| **us1/Edge security hardening** | ✅ **firewall + SSH + fail2ban** — see §16. DB/admin ports now Tailscale-only; public web/streaming/payment untouched. ❗ **Ufw NOT enabled** (would flush Docker's FORWARD chain) |
 
 ### Replication plumbing (us1 → ug)
 - Replicator role: `replicator` / password in `.env` (`REPLICATOR_PASSWORD`).
@@ -649,5 +650,208 @@ app → Go mesh (replicas) signSfxUrl → HMAC-signs the master playlist nativel
       CF-cached paths, no per-segment tokens) — currently the worker rewrites segment URIs.
 - [ ] Point the app's `sfx_signing.dart` at the Go mesh instead of `objects.solofx.net/_sign`.
 - [ ] Decide if per-segment token validation is wanted at all (origin is open; the playlist is the gate).
+
+---
+
+## 16. Security Hardening — us1/Edge (Supabase primary) ✅
+
+Audit (Aug 2026) found the **write primary** was the exposed node: **no firewall**, SSH
+**password auth on**, **no fail2ban**, no malware scanner, and Docker publishing 30+ ports
+to `0.0.0.0` — including Postgres `5432`, Supabase pooler/Supavisor `55432/6543`, Redis
+`6379`, Prometheus `9090`, Portainer `8000/9443/9001`, Loki `3100`, OpenWebUI `3000`, and
+Directus (payment CMS admin) `8055`. The other 4 nodes were already correctly firewalled.
+
+> ✅ **A firewall IS active.** It is enforced with **plain `iptables`**, not the `ufw`
+> wrapper — `ufw` being "inactive" does not mean no firewall. `iptables` (the actual packet
+> filter) has `INPUT policy DROP` + 10 explicit ACCEPT rules, and the `DOCKER-USER` chain has
+> 11 DROP rules, all live and persisted via `edge-firewall.service`.
+>
+> ❗ **Why not `ufw`:** `ufw enable` flushes and rebuilds Docker's `FORWARD` chain, which
+> would break **all** container networking on this production primary until Docker restarts.
+> So UFW is kept as a config reference only and **never enabled**; the same rules are applied
+> directly with `iptables` (zero outage risk).
+
+### 16.1 Network containment ✅
+
+**Plain-language summary of what the firewall does:**
+
+| Traffic | Policy |
+|---|---|
+| Host itself (host INPUT) | **DENY by default** (`INPUT policy DROP`) — only the rules below are allowed |
+| SSH `22`, web `80/443/81` (npm) | ✅ allowed (public) |
+| Tailscale mesh `100.64.0.0/10` + `tailscale0` iface + WireGuard UDP `41641` | ✅ allowed (replication, backups, admin, exporters) |
+| varnish shield `8556`, varnish video `8081` (from Docker bridge) | ✅ allowed (public + npm→varnish) |
+| Docker-published web/streaming/payment ports (Envoy `8555`, owncast `1935/8080`, playitloud `3005/3010`, DRM `3001`, stats `8099`, Directus `8055`) | ✅ public (kept by decision) |
+| Postgres `5432`, pooler `55432`, Supavisor `6543`, Redis `6379`, Prometheus `9090`, Portainer `8000/9443/9001`, Loki `3100`, video-downloader `3002` | 🔒 **Tailscale-only** (DOCKER-USER DROP from public) |
+| fail2ban banned IPs | 🚫 dropped (`f2b-sshd` chain) |
+
+**Implementation details:**
+
+- **Host `INPUT`** (`/home/customer/host-input-firewall.sh`): default **DROP**. Allows
+  loopback + established/related, the **Tailscale `ts-input` hook** (WireGuard UDP 41641 +
+  CGNAT — preserved), Tailscale `100.64.0.0/10`, `22/80/443/81`, host-network varnish
+  `8556` (public shield), and Docker bridge `172.16.0.0/12 → 8081/8556` (npm→varnish).
+- **`DOCKER-USER`** (`/home/customer/docker-user-firewall.sh`): ACCEPT Tailscale `100.64.0.0/10`
+  + Docker bridges `172.16.0.0/12` + loopback; then **DROP** public access to the restricted
+  containers. Everything else (`RETURN`) stays public.
+- **Corrected for Docker DNAT:** Docker rewrites the published→internal port *before*
+  `DOCKER-USER` sees the packet (e.g. `55432→5432`, `3000→8080`, `8555→8000`). Rules therefore
+  match **container destination IP + internal port**, not the published port — this was the bug
+  that initially left OpenWebUI exposed and briefly blocked streaming-web/enovy. Container IPs
+  are pinned in the script; **re-run the script if a container is recreated with a new IP.**
+- **Persistence:** `edge-firewall.service` (oneshot, `After=docker.service tailscaled.service`)
+  re-applies both scripts on boot; `RemainAfterExit=yes`. Also a copy of the pre-change
+  iptables state is saved in `/home/customer/iptables-backup-*.rules`.
+
+**Public-keep list (unchanged):** `80/443/81` (npm), `8555` (Envoy API), `8556` (varnish
+shield), `1935`/`8080` (owncast), `3005`/`3010` (playitloud web/admin), `3001` (DRM), `8099`
+(viewer stats), and `8055` (Directus CMS / payment gateway — kept public by decision).
+
+**Tailscale-only now:** `5432`, `55432`, `6543`, `6379`, `9090`, `3000`, `8000`, `9443`,
+`9001`, `3100`, `3002`. Replication, geo reads, and restic backups are **unaffected** — they
+all travel over Tailscale (`100.64.0.0/10` accepted) and were verified live: 5 replicas
+streaming with 0 lag, geo-routed anon reads 200 (US + spoofed `CF-IPCountry: UG` → ug), restic
+snapshots reachable.
+
+### 16.2 SSH + brute-force ✅
+- `PasswordAuthentication no`, `MaxAuthTries 3` — set in `sshd_config` **and** the
+  cloud-init drop-in `/etc/ssh/sshd_config.d/50-cloud-init.conf` (it overrode the main config).
+  Verified: `Permission denied (publickey)` for password attempts; key auth still works.
+- **fail2ban** (`/etc/fail2ban/jail.local`): `[sshd]` jail, `maxretry 5 / findtime 10m /
+  bantime 10m`, `iptables-multiport`. Banned 4 scanning IPs within the first minutes of
+  activation.
+
+### 16.3 Malware scanning ⏳ (deferred)
+- ClamAV + rkhunter + Lynis **install aborted** — `apt-get install` hung (killed cleanly,
+  `dpkg --configure -a` completed with no errors, apt healthy, nothing half-installed).
+  **TODO:** retry the install, then add a weekly scan cron (Sun 02:00) + daily on-demand
+  ClamAV of `/media/data` (payment DB) and `restic check` in the backup cron.
+
+### 16.4 Directus / payment layer (deferred by decision)
+- Directus `docker-compose.yml` hardcodes `ADMIN_PASSWORD: "d1r3ctu5"` and
+  `SECRET: "et45yehrffgdt4jshr"` in plaintext; `api_keys` table stores the Yo! Payments
+  password in plaintext. **Not rotated** (user chose "backup only").
+- **Directus DB backup is live** (`backup-directus-db.sh`, daily 03:15, separate restic repo
+  `edge-directus`): SQLite online-backup → gzip → restic. 2 GB DB → ~148 MB stored; restore
+  verified (151,894 `general_collections` rows + 629,068 `directus_activity` rows queryable).
+- **TODO:** rotate Directus SECRET/ADMIN_PASSWORD + Yo/MTN keys; investigate IP
+  `146.70.186.116` (21k activity events incl. `directus_flows` edits, no recorded login).
+
+### 16.5 Streaming note
+- OvenMediaEngine (`ovenmediaengine`, host-network) has been **exited 10 days** —
+  `live.solofx.net` → 525. Left as-is by decision; not caused by the firewall (it was down
+  before). Live streaming remains an open item outside this hardening scope.
+
+---
+
+## 17. OpenSearch — dedicated search node on the mesh ✅
+
+New cluster node **`srt-node`** (`139.144.77.47`, SSH alias `edge-srt`, Debian 11, 2 cores /
+3.8 GB) — repurposed SRT box now doubling as the mesh's **search node**. Tailnet IP
+`100.127.244.33`; added via `tailscale up` (srt-node joins the existing tailnet — the new
+firewall on us1 already ACCEPTs `100.64.0.0/10`, so no mesh changes needed).
+
+### Node cleanup (memory)
+- Was 3.4 GB used / 192 MB free. Root cause: **440 `docker-proxy` processes** spawned by
+  `srt_proxy_pro` (402 published UDP ports `20000-20400`) + `restreamer`'s 24/7 ffmpeg.
+- Stopped + `--restart=no`: `affectionate_pare` (srt_proxy_pro, 0 connections) and
+  `restreamer`. Kept: `NginX` (npm :81/443), `Teradek_Sputnik` (SRT :554), `nimble`,
+  portainer. **Result: 3.4 GiB → 788 MiB used (2.8 GiB free).**
+
+### OpenSearch deployment
+- **Container** `opensearchproject/opensearch:2.19.0`, `--restart unless-stopped`,
+  `discovery.type=single-node`, `OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g`.
+- **Tailscale-only**: bound `100.127.244.33:9200` (HTTP) + `:9600` (metrics) — **not
+  public** (verified blocked from the internet).
+- `vm.max_map_count=262144` (persisted in `/etc/sysctl.conf`) — Lucene mmap requirement.
+- Data persisted at `/opt/opensearch/data`. Security plugin **enabled** (TLS + auth; initial
+  admin password set via `OPENSEARCH_INITIAL_ADMIN_PASSWORD`).
+- Verified: cluster GREEN, full-text `match` + **fuzzy** search OK over the tailnet from us1
+  and grafana; index/doc create/delete OK. (First search can miss a just-indexed doc until
+  the 1s `refresh_interval` — use `?refresh=true` or allow 1s.)
+
+### Indexer reads from REPLICAS — not the primary
+A search index is a **derived cache**, so it must NOT depend on the write primary. The
+connector reads catalog data from the **geo-routed read replicas** (tailnet, verified live
+from srt-node):
+
+| Replica | Endpoint (verified 200) | Path convention |
+|---|---|---|
+| us2 | `100.82.159.75:5557` | bare path `/tv_shows` |
+| eu1 | `100.116.100.32:5557` | `/rest/v1/tv_shows` (nginx strips prefix) |
+| eu2 | `100.99.30.100:5557` | `/rest/v1/tv_shows` (nginx strips prefix) |
+
+- **Failover order:** nearest-region replica → any other replica → primary only as last
+  resort. Index stays fresh even with the primary down (replicas keep serving reads).
+- **Sync:** interval/cron re-index (RPCs on replicas) and/or Supabase Realtime
+  `postgres_changes` (publication already exists) for incremental updates.
+- **Source tables:** `tv_shows`, `epg_programs`, `events`, `ads`, `users` — Directus content
+  (`articles` etc.) comes from the Directus SQLite DB (separate source), not the replicas.
+
+### Sync connector ✅ (Go indexer, `gofn-indexer/`)
+- **`salt-gofn-indexer`** — stdlib-only Go binary that reads catalog data from the
+  **read replicas** over Tailscale and bulk-loads into OpenSearch. Deployed to srt-node
+  (`/opt/opensearch-indexer/`), runs via systemd timer every **10 min** (oneshot, full
+  idempotent rebuild per run).
+- **Failover verified live:** dead replica first → times out (15 s) → next replica serves.
+  Order: us2 (`:5557` bare) → eu1 (`:5557/rest/v1`) → eu2 (`:5557/rest/v1`). Primary is
+  deliberately **not** in the list. Replica base URLs must include each node's path
+  convention (us2 bare, eu1/eu2 `/rest/v1` nginx-strip).
+- **Indexes:** `saltmedia-tv_shows`, `saltmedia-epg_programs`, `saltmedia-events`,
+  `saltmedia-ads`, `saltmedia-users` (7,959 docs live: 8 shows, 145 EPG, 1 event, 7,805
+  users with names). Users are paginated (1000/page; replicas return HTTP 206 for
+  paginated reads, treated as success) and filtered to non-null names.
+- **Verified:** full-text `match`, **fuzzy** typo search (`Sportz`→`Sports`), and
+  multi-field search (title+description; user name+email) all return correct hits over
+  the tailnet.
+
+### App catalog search wired to OpenSearch ✅
+- `supabase-api` (Go service, `/api/v1/catalog`) now queries **OpenSearch first** with
+  fuzzy multi-field match on `saltmedia-tv_shows`, **falling back to PostgREST `ilike`**
+  if OpenSearch is unreachable. Verified both paths:
+  - OpenSearch: `q=Sportz` → `Sports` (response `search: opensearch`)
+  - Fallback: stopping OpenSearch → same query returns via PostgREST (`search: postgrest`),
+    and auto-recovers when OpenSearch returns.
+- **App-facing `/rest/v1` search:** `search_catalog` PostgREST RPC (migration
+  `008_search_catalog_rpc.sql`) runs on the replicas and is geo-routed/CDN-cached —
+  the app calls `GET /rest/v1/rpc/search_catalog?q=...&type=...&limit=&offset=`. Uses
+  pg_trgm similarity ranking over `tv_shows` (title/description). Verified 200 through
+  `edge.solofx.net/rest/v1/rpc/search_catalog` for all geo regions.
+- **Admin user search** (`/api/v1`): `getUsersPaginated` (and `searchUsers`) in the Go
+  service back the admin dashboard's user-management page via OpenSearch `saltmedia-users`.
+  Response shape matches the dashboard's `GetUsersPaginatedResponse`. Search ~0.13s,
+  fuzzy typo tolerant (`masara`→`masera`/`Masaba Ronald`). No-search lists page via
+  PostgREST. The dashboard needed **no frontend changes** (its `/api/users` route already
+  proxies to `getUsersPaginated`, which previously 404'd).
+- **Varnish search caching** ✅: the us1 origin shield (`supabase-varnish` on :8556,
+  VCL `/home/customer/varnish/supabase-shield.vcl`) now caches **search responses** so
+  repeated queries don't hit the Go service/OpenSearch:
+  - `/api/v1/getUsersPaginated` + `/api/v1/searchUsers` → `X-Cache-Rule=search`, **10s TTL**
+    (URL keyed: searchTerm/page/limit are in the query string; response is admin-shared,
+    not per-user).
+  - `/rest/v1/rpc/search_catalog` (app) already cached as anon `/rest/v1/*` read (60s).
+  - Verified through `edge.solofx.net` (tunnel → :8556 shield): admin search and app
+    `search_catalog` both MISS → HIT. Reload = `docker restart supabase-varnish`;
+    pre-change VCL backed up as `supabase-shield.vcl.bak.<date>`.
+- Enabled via `OPENSEARCH_URL` / `OPENSEARCH_USER` / `OPENSEARCH_PASSWORD` /
+  `OPENSEARCH_INSECURE` env on the `supabase-api` container (recreated with
+  `salt-gofn:new`).
+- **OpenSearch credentials:** production uses the **`appsearch`** internal user
+  (password generated + rotated at setup) scoped to role `saltmedia_search`
+  (index pattern `saltmedia-*` only — verified 403 on system indices). The default
+  `admin` user is reserved and kept as break-glass; the demo password from first boot
+  is superseded — **do not re-use `OPENSEARCH_INITIAL_ADMIN_PASSWORD` in app config**.
+- Build/deploy: `gofn-indexer/README.md` (env vars + examples).
+- **Directus content** (`articles` etc.) is a separate source (Directus SQLite DB), not
+  indexed by this connector yet.
+
+### Open TODOs
+- [ ] RBAC: scoped roles per index (`saltmedia_*` etc.) instead of admin account; rotate the
+      initial admin password.
+- [ ] Optional: Supabase Realtime `postgres_changes` incremental updates (the 10-min full
+      rebuild is sufficient today).
+- [ ] OpenSearch-Dashboards for attack-log analysis (§16.4 forensics) — bind tailnet-only.
+- [ ] Decide: keep on this box (SRT co-tenant) vs move to a dedicated 8 GB VPS if search
+      volume grows.
 
 ---
