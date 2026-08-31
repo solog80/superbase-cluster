@@ -66,6 +66,7 @@ type indexDef struct {
 	table   string
 	selects string
 	filter  string // optional PostgREST filter, e.g. "name=not.is.null"
+	order   string // stable sort column for deterministic pagination (defaults to "id")
 }
 
 var indices = []indexDef{
@@ -74,6 +75,8 @@ var indices = []indexDef{
 	{index: "events", table: "events", selects: "*"},
 	{index: "ads", table: "ads", selects: "*"},
 	{index: "users", table: "users", selects: "id,name,email,user_name,profile_image_url,role,is_admin,is_blocked,is_verified,is_anonymous,created_at,updated_at", filter: "name=not.is.null"},
+	{index: "episodes", table: "episodes", selects: "id,season_id,show_id,title,description,duration,thumbnail,date_uploaded,published", filter: "published=eq.true"},
+	{index: "bible_verses", table: "bible_verses", selects: "id,version,book,book_display,chapter,verse,text"},
 }
 
 func main() {
@@ -166,7 +169,7 @@ func getenv(k, def string) string {
 //
 // The table is appended directly to the base URL. Fetches ALL rows in pages
 // of 1000 (reads Content-Range for the total when the replica returns it).
-func (ix *indexer) replicaRead(ctx context.Context, table, sel, filter string) ([]json.RawMessage, error) {
+func (ix *indexer) replicaRead(ctx context.Context, table, sel, filter, order string) ([]json.RawMessage, error) {
 	var all []json.RawMessage
 	var lastErr error
 	for _, base := range ix.replicas {
@@ -177,6 +180,10 @@ func (ix *indexer) replicaRead(ctx context.Context, table, sel, filter string) (
 			if filter != "" {
 				u += "&" + filter
 			}
+			if order == "" {
+				order = "id"
+			}
+			u += "&order=" + urlQueryEscape(order)
 			req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 			if err != nil {
 				lastErr = err
@@ -235,7 +242,7 @@ func (ix *indexer) runFull(ctx context.Context) error {
 	total := 0
 	for _, def := range indices {
 		idx := ix.prefix + "-" + def.index
-		rows, err := ix.replicaRead(ctx, def.table, def.selects, def.filter)
+		rows, err := ix.replicaRead(ctx, def.table, def.selects, def.filter, def.order)
 		if err != nil {
 			return fmt.Errorf("%s: %w", def.table, err)
 		}
@@ -306,19 +313,20 @@ func (ix *indexer) indexJoomla(ctx context.Context) (int, error) {
 			// OpenSearch boolean mapping.
 			featured := toBool(attrs["featured"])
 			doc := map[string]any{
-				"id":         attrs["id"],
-				"title":      attrs["title"],
-				"alias":      attrs["alias"],
-				"category":   joomlaCategory(item),
-				"created":    attrs["created"],
-				"publish_up": attrs["publish_up"],
-				"state":      attrs["state"],
-				"hits":       attrs["hits"],
-				"featured":   featured,
-				"created_by": attrs["created_by"],
-				"images":     attrs["images"],
-				"metadesc":   attrs["metadesc"],
-				"body":       attrs["text"],
+				"id":               attrs["id"],
+				"title":            attrs["title"],
+				"alias":            attrs["alias"],
+				"category":         joomlaCategory(item),
+				"created":          attrs["created"],
+				"publish_up":       attrs["publish_up"],
+				"state":            attrs["state"],
+				"hits":             attrs["hits"],
+				"featured":         featured,
+				"created_by":       attrs["created_by"],
+				"created_by_alias": attrs["created_by_alias"],
+				"images":           attrs["images"],
+				"metadesc":         attrs["metadesc"],
+				"body":             attrs["text"],
 			}
 			b, _ := json.Marshal(doc)
 			rows = append(rows, b)
@@ -373,7 +381,7 @@ func (ix *indexer) rebuildIndex(ctx context.Context, index string, rows []json.R
 	// 404 = fine (no index yet). Other errors logged but we continue to create.
 
 	// Create index (idempotent).
-	mapping := fmt.Sprintf(`{"settings":{"number_of_shards":1,"number_of_replicas":0},"mappings":{"properties":{"title":{"type":"text"},"program_name":{"type":"text"},"description":{"type":"text"},"genre":{"type":"keyword"},"type":{"type":"keyword"},"station_id":{"type":"keyword"},"published":{"type":"boolean"},"name":{"type":"text"},"email":{"type":"keyword"},"user_name":{"type":"text"},"role":{"type":"keyword"},"is_admin":{"type":"boolean"},"is_blocked":{"type":"boolean"},"body":{"type":"text"},"category":{"type":"keyword"},"featured":{"type":"boolean"}}}}`)
+	mapping := fmt.Sprintf(`{"settings":{"number_of_shards":1,"number_of_replicas":0},"mappings":{"properties":{"title":{"type":"text"},"program_name":{"type":"text"},"presenter":{"type":"text"},"details":{"type":"text"},"description":{"type":"text"},"genre":{"type":"keyword"},"type":{"type":"keyword"},"station_id":{"type":"keyword"},"published":{"type":"boolean"},"name":{"type":"text"},"email":{"type":"text","fields":{"keyword":{"type":"keyword","ignore_above":256}}},"user_name":{"type":"text"},"role":{"type":"keyword"},"is_admin":{"type":"boolean"},"is_blocked":{"type":"boolean"},"body":{"type":"text"},"category":{"type":"keyword"},"featured":{"type":"boolean"},"created_by":{"type":"keyword"},"created_by_alias":{"type":"text"},"show_id":{"type":"keyword"},"season_id":{"type":"keyword"},"duration":{"type":"integer"},"thumbnail":{"type":"keyword"},"date_uploaded":{"type":"date"},"version":{"type":"keyword"},"book":{"type":"keyword"},"book_display":{"type":"text"},"chapter":{"type":"integer"},"verse":{"type":"integer"},"text":{"type":"text"}}}}`)
 	creq, _ := http.NewRequestWithContext(ctx, http.MethodPut, fmt.Sprintf("%s/%s", ix.osURL, index), bytes.NewBufferString(mapping))
 	creq.Header.Set("Content-Type", "application/json")
 	ix.setAuth(creq)

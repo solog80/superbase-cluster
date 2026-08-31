@@ -78,6 +78,31 @@ func (s *server) startScheduler() {
 		}
 	})
 
+	// Pre-warm the analytics dashboard RPCs (shared in-memory cache) so the
+	// first page load — which otherwise scans millions of rows — is instant.
+	go s.runEvery(45*time.Second, func(ctx context.Context) {
+		// The dashboard's default request is days=30 + today's date range.
+		now := time.Now().UTC().Format("2006-01-02")
+		radioArgs := map[string]any{"p_days": 30, "p_start": now, "p_end": now}
+		if _, err := s.radioRPCPayload(ctx, "get_analytics_metrics", nil, nil, metricsCacheTTL); err != nil {
+			log.Printf("scheduler analytics warm: metrics: %v", err)
+			return
+		}
+		if _, err := s.radioRPCPayload(ctx, "get_radio_reports", []string{"p_days", "p_start", "p_end"}, radioArgs, rpcCacheTTL); err != nil {
+			log.Printf("scheduler analytics warm: reports: %v", err)
+			return
+		}
+		if _, err := s.radioRPCPayload(ctx, "get_radio_show_analytics", []string{"p_days", "p_start", "p_end"}, radioArgs, rpcCacheTTL); err != nil {
+			log.Printf("scheduler analytics warm: shows: %v", err)
+			return
+		}
+		if _, err := s.radioRPCPayload(ctx, "get_radio_show_snapshots", []string{"p_start", "p_end"}, map[string]any{"p_start": now, "p_end": now}, rpcCacheTTL); err != nil {
+			log.Printf("scheduler analytics warm: snapshots: %v", err)
+			return
+		}
+		log.Printf("scheduler analytics warm: ok")
+	})
+
 	// On-demand cache warm (replaces scheduleOnDemandCacheRefresh, 6h).
 	go s.runEvery(6*time.Hour, func(ctx context.Context) {
 		if err := s.refreshOndemandCache(ctx); err != nil {
@@ -85,6 +110,23 @@ func (s *server) startScheduler() {
 			return
 		}
 		log.Printf("scheduler ondemand cache: warmed")
+	})
+
+	// Viewer device/OS/geo daily aggregates (BigQuery viewer_logs -> TSDB).
+	// One-time 30-day backfill, then keep the trailing 2 days fresh hourly.
+	go s.runEvery(24*time.Hour, func(ctx context.Context) {
+		s.backfillViewerDaily(ctx, 30)
+	})
+	go s.runEvery(time.Hour, func(ctx context.Context) {
+		today := time.Now().UTC().Format("2006-01-02")
+		yesterday := time.Now().UTC().AddDate(0, 0, -1).Format("2006-01-02")
+		for _, d := range []string{yesterday, today} {
+			if err := s.syncViewerDay(ctx, d); err != nil {
+				log.Printf("scheduler viewer sync %s: %v", d, err)
+			} else {
+				log.Printf("scheduler viewer sync %s: ok", d)
+			}
+		}
 	})
 }
 

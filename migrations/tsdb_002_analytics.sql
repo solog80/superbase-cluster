@@ -181,26 +181,33 @@ begin
       group by content_id
     ),
     metadata as (
-      select content_id, station_name, thumbnail_url
+      select distinct on (content_id) content_id, station_name, thumbnail_url
       from public.epg_metadata
+      order by content_id, last_updated desc
+    ),
+    ranked as (
+      select
+        vs.content_id,
+        vs.content_name,
+        vs.content_type,
+        coalesce(ps.total_watch_time, 0) as total_watch_time,
+        coalesce(m.station_name, case
+          when vs.content_id like 'salt_tv_one%' then 'Salt TV One'
+          when vs.content_id like 'salt_tv_two%' then 'Salt TV Two'
+          when vs.content_type = 'radio' then 'Salt FM'
+          else 'Other' end) as station,
+        coalesce(m.thumbnail_url, '') as thumbnail_url,
+        vs.views,
+        row_number() over (order by vs.views desc) as global_rank,
+        row_number() over (partition by vs.content_type order by vs.views desc) as type_rank
+      from view_stats vs
+      left join progress_stats ps on ps.content_id = vs.content_id
+      left join metadata m on m.content_id = vs.content_id
     )
-    select
-      vs.content_id,
-      vs.content_name,
-      vs.content_type,
-      coalesce(ps.total_watch_time, 0) as total_watch_time,
-      coalesce(m.station_name, case
-        when vs.content_id like 'salt_tv_one%' then 'Salt TV One'
-        when vs.content_id like 'salt_tv_two%' then 'Salt TV Two'
-        when vs.content_type = 'radio' then 'Salt FM'
-        else 'Other' end) as station,
-      coalesce(m.thumbnail_url, '') as thumbnail_url,
-      vs.views
-    from view_stats vs
-    left join progress_stats ps on ps.content_id = vs.content_id
-    left join metadata m on m.content_id = vs.content_id
-    order by vs.views desc
-    limit 20
+    select content_id, content_name, content_type, total_watch_time, station, thumbnail_url, views
+    from ranked
+    where global_rank <= 20 or type_rank <= 5
+    order by views desc
   ),
   top_arr as (
     select coalesce(jsonb_agg(jsonb_build_object(

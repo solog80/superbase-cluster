@@ -103,24 +103,32 @@ func (s *server) handleGetNewsArticles(w http.ResponseWriter, r *http.Request) {
 		if err == nil {
 			data := make([]map[string]any, 0, len(rows))
 			for _, src := range rows {
+				attributes := map[string]any{
+					"id":         src["id"],
+					"title":      src["title"],
+					"alias":      src["alias"],
+					"state":      src["state"],
+					"hits":       src["hits"],
+					"featured":   src["featured"],
+					"created":    src["created"],
+					"publish_up": src["publish_up"],
+					"images":     src["images"],
+					"text":       src["body"],
+				}
+				if alias, ok := src["created_by_alias"]; ok && alias != nil {
+					attributes["created_by_alias"] = fmt.Sprint(alias)
+				}
+				relationships := map[string]any{
+					"category": map[string]any{"data": map[string]any{"type": "categories", "id": src["category"]}},
+				}
+				if cb, ok := src["created_by"]; ok && cb != nil && fmt.Sprint(cb) != "" {
+					relationships["created_by"] = map[string]any{"data": map[string]any{"type": "users", "id": fmt.Sprint(cb)}}
+				}
 				data = append(data, map[string]any{
-					"type": "articles",
-					"id":   fmt.Sprint(src["id"]),
-					"attributes": map[string]any{
-						"id":         src["id"],
-						"title":      src["title"],
-						"alias":      src["alias"],
-						"state":      src["state"],
-						"hits":       src["hits"],
-						"featured":   src["featured"],
-						"created":    src["created"],
-						"publish_up": src["publish_up"],
-						"images":     src["images"],
-						"text":       src["body"],
-					},
-					"relationships": map[string]any{
-						"category": map[string]any{"data": map[string]any{"type": "categories", "id": src["category"]}},
-					},
+					"type":          "articles",
+					"id":            fmt.Sprint(src["id"]),
+					"attributes":    attributes,
+					"relationships": relationships,
 				})
 			}
 			writeJSON(w, http.StatusOK, map[string]any{"data": data, "meta": map[string]any{"total": total, "limit": limit, "offset": offset}})

@@ -44,6 +44,13 @@ type server struct {
 
 	odMu    sync.Mutex
 	odCache *ondemandCacheEntry
+
+	odThumbMu      sync.Mutex
+	odThumbCache   map[string]string
+	odThumbExpires time.Time
+
+	// Serializes broadcast pushes (one at a time, TryLock for "in progress").
+	broadcastMu sync.Mutex
 }
 
 type catalogParams struct {
@@ -60,19 +67,20 @@ func main() {
 		log.Printf("timescale disabled: %v", err)
 	}
 	s := &server{
-		restURL:    strings.TrimSuffix(getenv("PG_REST_URL", "http://api-gw:8000/rest/v1"), "/"),
-		serviceKey: os.Getenv("SERVICE_ROLE_KEY"),
-		anonKey:    os.Getenv("ANON_KEY"),
-		client:     &http.Client{Timeout: 10 * time.Second},
-		osURL:      strings.TrimSuffix(os.Getenv("OPENSEARCH_URL"), "/"),
-		osUser:     getenv("OPENSEARCH_USER", "admin"),
-		osPass:     os.Getenv("OPENSEARCH_PASSWORD"),
-		osInsecure: os.Getenv("OPENSEARCH_INSECURE") == "1",
-		tsdb:       tsdb,
-		adsCache:   map[string]adsCacheEntry{},
-		rpcCache:   map[string]rpcCacheEntry{},
-		epgCache:   map[string]epgCacheEntry{},
-		odCache:    nil,
+		restURL:      strings.TrimSuffix(getenv("PG_REST_URL", "http://api-gw:8000/rest/v1"), "/"),
+		serviceKey:   os.Getenv("SERVICE_ROLE_KEY"),
+		anonKey:      os.Getenv("ANON_KEY"),
+		client:       &http.Client{Timeout: 10 * time.Second},
+		osURL:        strings.TrimSuffix(os.Getenv("OPENSEARCH_URL"), "/"),
+		osUser:       getenv("OPENSEARCH_USER", "admin"),
+		osPass:       os.Getenv("OPENSEARCH_PASSWORD"),
+		osInsecure:   os.Getenv("OPENSEARCH_INSECURE") == "1",
+		tsdb:         tsdb,
+		adsCache:     map[string]adsCacheEntry{},
+		rpcCache:     map[string]rpcCacheEntry{},
+		epgCache:     map[string]epgCacheEntry{},
+		odCache:      nil,
+		odThumbCache: map[string]string{},
 	}
 	if s.osURL != "" {
 		tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: s.osInsecure}}
@@ -84,6 +92,7 @@ func main() {
 	mux.HandleFunc("/", s.dispatch)
 
 	s.startScheduler()
+	s.startNotificationStaleCleanup()
 
 	port := getenv("PORT", "8080")
 	log.Printf("salt-gofn listening on :%s rest=%s tsdb=%v", port, s.restURL, tsdb != nil)
@@ -124,6 +133,12 @@ func (s *server) dispatch(w http.ResponseWriter, r *http.Request) {
 		s.handleSearchUsers(w, r)
 	case "searchArticles":
 		s.handleSearchArticles(w, r)
+	case "searchOnDemand":
+		s.handleSearchOnDemand(w, r)
+	case "searchBible":
+		s.handleSearchBible(w, r)
+	case "searchEpg":
+		s.handleSearchEpg(w, r)
 	case "getNewsArticles":
 		s.handleGetNewsArticles(w, r)
 	case "getNewsArticle":
@@ -136,6 +151,30 @@ func (s *server) dispatch(w http.ResponseWriter, r *http.Request) {
 		s.handleDeleteJoomlaArticle(w, r)
 	case "getJoomlaReference":
 		s.handleGetJoomlaReference(w, r)
+	case "uploadNewsImage":
+		if !s.isServiceKey(r) {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"success": false, "error": "Unauthorized: Admin access required"})
+			return
+		}
+		s.handleUploadNewsImage(w, r)
+	case "listNewsImages":
+		if !s.isServiceKey(r) {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"success": false, "error": "Unauthorized: Admin access required"})
+			return
+		}
+		s.handleListNewsImages(w, r)
+	case "createNewsFolder":
+		if !s.isServiceKey(r) {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"success": false, "error": "Unauthorized: Admin access required"})
+			return
+		}
+		s.handleCreateNewsFolder(w, r)
+	case "deleteNewsImage":
+		if !s.isServiceKey(r) {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"success": false, "error": "Unauthorized: Admin access required"})
+			return
+		}
+		s.handleDeleteNewsImage(w, r)
 	case "getUsersPaginated":
 		if !s.isServiceKey(r) {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"success": false, "error": "Unauthorized: Admin access required"})
@@ -164,6 +203,14 @@ func (s *server) dispatch(w http.ResponseWriter, r *http.Request) {
 		s.trackContentSession(w, r)
 	case "getAnalyticsMetrics":
 		s.handleGetAnalyticsMetrics(w, r)
+	case "getFirebaseAnalytics":
+		s.handleGetFirebaseAnalytics(w, r)
+	case "getGa4Analytics":
+		if !s.isServiceKey(r) {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"success": false, "error": "Unauthorized: Admin access required"})
+			return
+		}
+		s.handleGetGa4Analytics(w, r)
 	case "getRadioHistory":
 		s.handleGetRadioHistory(w, r)
 	case "getRadioReports":
@@ -176,6 +223,31 @@ func (s *server) dispatch(w http.ResponseWriter, r *http.Request) {
 		s.handleGetRadioShowSnapshots(w, r)
 	case "getRadioShowListenerDetails":
 		s.handleGetRadioShowListenerDetails(w, r)
+	case "getAdminAnalytics":
+		if !s.isServiceKey(r) {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"success": false, "error": "Unauthorized: Admin access required"})
+			return
+		}
+		s.handleGetAdminAnalytics(w, r)
+	case "sendNotification", "getSentNotifications", "getLinkMetadata", "deleteNotification", "clearSentNotifications", "deleteNotifications":
+		if !s.isServiceKey(r) {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"success": false, "error": "Unauthorized: Admin access required"})
+			return
+		}
+		switch name {
+		case "sendNotification":
+			s.handleSendNotification(w, r)
+		case "getSentNotifications":
+			s.handleGetSentNotifications(w, r)
+		case "getLinkMetadata":
+			s.handleGetLinkMetadata(w, r)
+		case "deleteNotification":
+			s.handleDeleteNotification(w, r)
+		case "clearSentNotifications":
+			s.handleClearSentNotifications(w, r)
+		case "deleteNotifications":
+			s.handleDeleteNotifications(w, r)
+		}
 	case "syncAzuraCastHistory":
 		s.handleSyncRadioHistory(w, r)
 	case "syncAzuraCastReports":
@@ -292,6 +364,7 @@ func (s *server) publicFn(name string) bool {
 		"batchTrackWatchProgress",
 		"batchTrackContentSessions",
 		"getAnalyticsMetrics",
+		"getFirebaseAnalytics",
 		"getRadioHistory",
 		"getRadioReports",
 		"getRadioCountryDetails",
@@ -740,6 +813,263 @@ func (s *server) osSearchUsers(ctx context.Context, q string, limit, offset int)
 		rows = append(rows, h.Source)
 	}
 	return rows, out.Hits.Total.Value, nil
+}
+
+// handleSearchOnDemand: OpenSearch search for on-demand content.
+//   - `showId` present  → search episodes within that show (saltmedia-episodes).
+//   - `showId` absent   → search published shows (saltmedia-tv_shows).
+//
+// Response: { success, data: { shows|episodes: [...], count, limit, offset } }.
+// Public/anon accessible (on-demand content is public).
+func (s *server) handleSearchOnDemand(w http.ResponseWriter, r *http.Request) {
+	qv := r.URL.Query()
+	q := qv.Get("q")
+	showID := qv.Get("showId")
+	limit, _ := strconv.Atoi(qv.Get("limit"))
+	offset, _ := strconv.Atoi(qv.Get("offset"))
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	if s.osClient == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"success": false, "error": "search unavailable"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	if showID != "" {
+		rows, total, err := s.osSearchEpisodes(ctx, q, showID, limit, offset)
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]any{"success": false, "error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"success": true,
+			"data":    map[string]any{"episodes": rows, "count": total, "limit": limit, "offset": offset},
+		})
+		return
+	}
+
+	rows, total, err := s.osSearchShows(ctx, q, limit, offset)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"success": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"success": true,
+		"data":    map[string]any{"shows": rows, "count": total, "limit": limit, "offset": offset},
+	})
+}
+
+// osSearch runs an OpenSearch search against the given index and returns the
+// source rows plus total hit count.
+func (s *server) osSearch(ctx context.Context, index string, query map[string]any, limit, offset int) ([]map[string]any, int, error) {
+	body, _ := json.Marshal(map[string]any{
+		"query": query,
+		"from":  offset,
+		"size":  limit,
+		"sort":  []any{map[string]any{"_score": "desc"}},
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.osURL+"/"+index+"/_search", bytes.NewReader(body))
+	if err != nil {
+		return nil, 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.SetBasicAuth(s.osUser, s.osPass)
+	resp, err := s.osClient.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 300 {
+		return nil, 0, fmt.Errorf("os HTTP %d", resp.StatusCode)
+	}
+	var out struct {
+		Hits struct {
+			Total struct {
+				Value int `json:"value"`
+			} `json:"total"`
+			Hits []struct {
+				Source map[string]any `json:"_source"`
+			} `json:"hits"`
+		} `json:"hits"`
+	}
+	if err := json.Unmarshal(respBody, &out); err != nil {
+		return nil, 0, err
+	}
+	rows := make([]map[string]any, 0, len(out.Hits.Hits))
+	for _, h := range out.Hits.Hits {
+		rows = append(rows, h.Source)
+	}
+	return rows, out.Hits.Total.Value, nil
+}
+
+// osSearchShows queries saltmedia-tv_shows for published shows, phrase-prefix
+// matching on title/description (search-as-you-type friendly: "conne" → Connected).
+func (s *server) osSearchShows(ctx context.Context, q string, limit, offset int) ([]map[string]any, int, error) {
+	var query map[string]any
+	if q == "" {
+		query = map[string]any{"term": map[string]any{"published": true}}
+	} else {
+		query = map[string]any{
+			"bool": map[string]any{
+				"must": []any{
+					map[string]any{"multi_match": map[string]any{"query": q, "fields": []string{"title", "description"}, "type": "phrase_prefix"}},
+				},
+				"filter": []any{
+					map[string]any{"term": map[string]any{"published": true}},
+				},
+			},
+		}
+	}
+	return s.osSearch(ctx, "saltmedia-tv_shows", query, limit, offset)
+}
+
+// osSearchEpisodes queries saltmedia-episodes for episodes within a show,
+// phrase-prefix matching on title/description.
+func (s *server) osSearchEpisodes(ctx context.Context, q, showID string, limit, offset int) ([]map[string]any, int, error) {
+	var query map[string]any
+	if q == "" {
+		query = map[string]any{"term": map[string]any{"show_id": showID}}
+	} else {
+		query = map[string]any{
+			"bool": map[string]any{
+				"must": []any{
+					map[string]any{"multi_match": map[string]any{"query": q, "fields": []string{"title", "description"}, "type": "phrase_prefix"}},
+				},
+				"filter": []any{
+					map[string]any{"term": map[string]any{"show_id": showID}},
+				},
+			},
+		}
+	}
+	return s.osSearch(ctx, "saltmedia-episodes", query, limit, offset)
+}
+
+// handleSearchBible: OpenSearch search over Bible verses (saltmedia-bible_verses).
+// `version` is required (scoped to the reader's selected translation); `book`
+// optionally narrows to a single book. Phrase-prefix matching so
+// search-as-you-type works ("for god so loved", "romans").
+// Response: { success, data: { verses: [...], count, limit, offset } }.
+func (s *server) handleSearchBible(w http.ResponseWriter, r *http.Request) {
+	qv := r.URL.Query()
+	q := qv.Get("q")
+	version := qv.Get("version")
+	book := qv.Get("book")
+	limit, _ := strconv.Atoi(qv.Get("limit"))
+	offset, _ := strconv.Atoi(qv.Get("offset"))
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	if version == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"success": false, "error": "version is required"})
+		return
+	}
+	if s.osClient == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"success": false, "error": "search unavailable"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	rows, total, err := s.osSearchBible(ctx, q, version, book, limit, offset)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"success": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"success": true,
+		"data":    map[string]any{"verses": rows, "count": total, "limit": limit, "offset": offset},
+	})
+}
+
+// osSearchBible queries saltmedia-bible_verses with phrase-prefix matching on
+// verse text + book display name, filtered by version (and optional book).
+func (s *server) osSearchBible(ctx context.Context, q, version, book string, limit, offset int) ([]map[string]any, int, error) {
+	var query map[string]any
+	if q == "" {
+		query = map[string]any{"term": map[string]any{"version": version}}
+	} else {
+		query = map[string]any{
+			"bool": map[string]any{
+				"must": []any{
+					map[string]any{"multi_match": map[string]any{"query": q, "fields": []string{"text", "book_display"}, "type": "phrase_prefix"}},
+				},
+				"filter": []any{
+					map[string]any{"term": map[string]any{"version": version}},
+				},
+			},
+		}
+	}
+	if book != "" {
+		if bq, ok := query["bool"].(map[string]any); ok {
+			filters, _ := bq["filter"].([]any)
+			bq["filter"] = append(filters, map[string]any{"term": map[string]any{"book": book}})
+		}
+	}
+	return s.osSearch(ctx, "saltmedia-bible_verses", query, limit, offset)
+}
+
+// handleSearchEpg: OpenSearch search over EPG programs (saltmedia-epg_programs).
+// Phrase-prefix matching on program name / presenter / genre / details so
+// search-as-you-type works. Optional `stationId` narrows to one station.
+// Response: { success, data: { programs: [...], count, limit, offset } }.
+func (s *server) handleSearchEpg(w http.ResponseWriter, r *http.Request) {
+	qv := r.URL.Query()
+	q := qv.Get("q")
+	stationID := qv.Get("stationId")
+	limit, _ := strconv.Atoi(qv.Get("limit"))
+	offset, _ := strconv.Atoi(qv.Get("offset"))
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	if s.osClient == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"success": false, "error": "search unavailable"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	rows, total, err := s.osSearchEpg(ctx, q, stationID, limit, offset)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"success": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"success": true,
+		"data":    map[string]any{"programs": rows, "count": total, "limit": limit, "offset": offset},
+	})
+}
+
+// osSearchEpg queries saltmedia-epg_programs with phrase-prefix matching.
+func (s *server) osSearchEpg(ctx context.Context, q, stationID string, limit, offset int) ([]map[string]any, int, error) {
+	query := map[string]any{}
+	if q != "" {
+		query = map[string]any{
+			"bool": map[string]any{
+				"must": []any{
+					map[string]any{"multi_match": map[string]any{"query": q, "fields": []string{"program_name", "presenter", "details"}, "type": "phrase_prefix"}},
+				},
+			},
+		}
+	}
+	if stationID != "" {
+		if bq, ok := query["bool"].(map[string]any); ok {
+			filters, _ := bq["filter"].([]any)
+			bq["filter"] = append(filters, map[string]any{"term": map[string]any{"station_id": stationID}})
+		} else {
+			query = map[string]any{"bool": map[string]any{"filter": []any{map[string]any{"term": map[string]any{"station_id": stationID}}}}}
+		}
+	}
+	return s.osSearch(ctx, "saltmedia-epg_programs", query, limit, offset)
 }
 
 func (s *server) doRest(ctx context.Context, path string, values url.Values) ([]byte, http.Header, error) {

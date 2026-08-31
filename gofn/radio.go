@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -39,27 +40,49 @@ type rpcCacheEntry struct {
 // 60s cache is plenty fresh while turning ~25s aggregations into sub-ms hits.
 const rpcCacheTTL = 60 * time.Second
 
+// metricsCacheTTL — get_analytics_metrics() scans millions of rows (content
+// views / watch progress / sessions). Cache it longer so the analytics
+// dashboard's first paint and 30s polls are fast.
+const metricsCacheTTL = 300 * time.Second
+
 // callRadioRPCRaw runs an RPC and returns the raw payload bytes, or nil if an
 // error response was already written. Results are cached in-memory (keyed by
 // RPC + args) so the slow radio aggregations don't re-run on every dashboard
 // poll.
+var errTsdbUnavailable = errors.New("timescale unavailable")
+
 func (s *server) callRadioRPCRaw(w http.ResponseWriter, r *http.Request, rpc string, order []string, args map[string]any) []byte {
-	db, err := s.tsdbDB(r.Context())
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	payload, err := s.radioRPCPayload(ctx, rpc, order, args, rpcCacheTTL)
 	if err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": err.Error()})
+		if errors.Is(err, errTsdbUnavailable) {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": err.Error()})
+		} else {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		}
 		return nil
+	}
+	return payload
+}
+
+// radioRPCPayload runs a TimescaleDB analytics RPC and returns its cached JSON
+// payload bytes. Shared by the single-reader handlers, the aggregated
+// getAdminAnalytics handler (which tolerates per-RPC failures), and the
+// scheduler's dashboard pre-warm. ttl controls the in-memory cache lifetime.
+func (s *server) radioRPCPayload(ctx context.Context, rpc string, order []string, args map[string]any, ttl time.Duration) ([]byte, error) {
+	db, err := s.tsdbDB(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", errTsdbUnavailable, err)
 	}
 	key := rpcCacheKey(rpc, order, args)
 
 	s.rpcMu.Lock()
 	if e, ok := s.rpcCache[key]; ok && time.Now().Before(e.expiresAt) {
 		s.rpcMu.Unlock()
-		return e.payload
+		return e.payload, nil
 	}
 	s.rpcMu.Unlock()
-
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-	defer cancel()
 
 	query := "SELECT payload::text FROM public." + rpc + "("
 	params := []any{}
@@ -80,14 +103,13 @@ func (s *server) callRadioRPCRaw(w http.ResponseWriter, r *http.Request, rpc str
 
 	var payload []byte
 	if err := db.QueryRowContext(ctx, query, params...).Scan(&payload); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-		return nil
+		return nil, err
 	}
 
 	s.rpcMu.Lock()
-	s.rpcCache[key] = rpcCacheEntry{payload: payload, expiresAt: time.Now().Add(rpcCacheTTL)}
+	s.rpcCache[key] = rpcCacheEntry{payload: payload, expiresAt: time.Now().Add(ttl)}
 	s.rpcMu.Unlock()
-	return payload
+	return payload, nil
 }
 
 // rpcCacheKey builds a stable key from the RPC name + its args (in column
