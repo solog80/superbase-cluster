@@ -901,3 +901,45 @@ from srt-node):
       volume grows.
 
 ---
+
+## 18. Joomla site — login lockdown + Cloudflare cache fix (saltmedia.ug) ✅
+
+Debugging a frontend login failure (`/en/component/users/?task=user.login` redirect loop)
+uncovered two separate root causes on the **Joomla site** (cPanel host `65.181.111.128`,
+separate from the Supabase mesh):
+
+### 18.1 Root cause 1 — Cloudflare was caching the login page
+- The zone had a **site-wide cache rule** (`edge_ttl override_origin`, 86400s / 24h) that
+  cached **all** Joomla pages, including `/component/users/` (login). A cached login page
+  carries **no session cookie**, so the form CSRF token could never validate → login always
+  failed (and a GET to `task=user.login` 303-looped).
+- **Fix:** removed the aggressive site-cache rule; added a **login bypass** cache rule
+  (`cache: false` for `/component/users/`, `/login`, `/edit/`) and a **static-asset cache**
+  rule (JS/CSS/images/fonts → `override_origin`, 86400s). Pages now `respect_origin`
+  (Joomla sends `no-store`, so they're not edge-cached; login is never cached).
+- Also added `.htaccess` `Cache-Control: no-store` for login paths (belt-and-suspenders).
+- **Still-open edge limitation:** Cloudflare **strips `Set-Cookie`** for `/component/users/`
+  even with `cache: false` on this zone's Free plan (`cache_level: aggressive` not settable
+  via API). Frontend login remains impractical through CF; **use the admin backend** for
+  editing SP Page Builder pages. Fixing fully needs the dashboard cache_level change or a
+  paid plan.
+
+### 18.2 Root cause 2 — password auth was wide open / then too locked
+- After earlier hardening, core `plg_authentication_joomla` (password for everyone) was
+  **disabled** and a custom **`plg_authentication_soloonly`** plugin (only user `solo`,
+  id 438) handled password auth. During debugging the core plugin was re-enabled (open),
+  then **re-locked** to `soloonly`-only (verified: solo logs in, `saltapi` rejected).
+- **Current auth state:** `joomla=0` (core password off), `soloonly=1` (solo-only password),
+  `cookie=1`, WebAuthn passkey enabled. Solo has re-added MFA (TOTP) and changed password.
+- **Plugin files** on the host: `plugins/authentication/soloonly/{soloonly.xml, src/, services/}`
+  (extension_id 393). TOTP/MFA tables: `#__user_mfa`, `#__user_profiles`.
+
+### 18.3 Operational notes
+- **Editing SPP pages:** use the **admin backend** (`/administrator/` → Components → SP
+  Page Builder). The frontend `/en/edit/6.html` editor requires frontend auth, which is
+  blocked by the CF Set-Cookie limitation above.
+- **Frontend login** for visitors is broken by the CF cookie limitation; admin login is fine.
+- Cache rules live in zone `http_request_cache_settings` (order: login-bypass → static-assets
+  → respect-origin default). Managed via the same CF API token used for the saltmedia.ug zone.
+
+---
