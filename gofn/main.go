@@ -51,6 +51,12 @@ type server struct {
 
 	// Serializes broadcast pushes (one at a time, TryLock for "in progress").
 	broadcastMu sync.Mutex
+
+	// SMS agent (TV-station Windows gateway) auth + outbox polling window.
+	smsAgentKey  string
+	waAppSecret  string
+	waVerifyToken string
+	waSystemToken string
 }
 
 type catalogParams struct {
@@ -81,6 +87,11 @@ func main() {
 		epgCache:     map[string]epgCacheEntry{},
 		odCache:      nil,
 		odThumbCache: map[string]string{},
+
+		smsAgentKey:    os.Getenv("SMS_AGENT_KEY"),
+		waAppSecret:    os.Getenv("WA_APP_SECRET"),
+		waVerifyToken:  os.Getenv("WA_VERIFY_TOKEN"),
+		waSystemToken:  os.Getenv("WA_SYSTEM_USER_TOKEN"),
 	}
 	if s.osURL != "" {
 		tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: s.osInsecure}}
@@ -115,7 +126,7 @@ func (s *server) dispatch(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "function not found"})
 		return
 	}
-	if name != "health" && name != "getApiConfig" && !s.publicFn(name) && !s.authorized(r) {
+	if name != "health" && name != "getApiConfig" && !s.publicFn(name) && !s.authorized(r) && !(agentEndpoints()[name] && s.isAgentRequest(r)) {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "invalid api key"})
 		return
 	}
@@ -220,6 +231,18 @@ func (s *server) dispatch(w http.ResponseWriter, r *http.Request) {
 		s.trackContentSession(w, r)
 	case "processChatMessage":
 		s.handleProcessChatMessage(w, r)
+	case "smsInbound":
+		s.handleSMSInbound(w, r)
+	case "smsOutboxPoll":
+		s.handleSMSOutboxPoll(w, r)
+	case "smsOutboxReport":
+		s.handleSMSOutboxReport(w, r)
+	case "enqueueSmsReply":
+		if !s.isServiceKey(r) {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"success": false, "error": "Unauthorized: Admin access required"})
+			return
+		}
+		s.enqueueSmsReply(w, r)
 	case "getAnalyticsMetrics":
 		s.handleGetAnalyticsMetrics(w, r)
 	case "getFirebaseAnalytics":
