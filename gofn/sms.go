@@ -81,7 +81,7 @@ func (s *server) handleSMSInbound(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	name := maskPhone(body.From)
+	name := body.From
 	msgID, err := s.insertInboundMessage(ctx, inboundMessage{
 		RoomID: roomID, Channel: "sms", ExternalID: body.From,
 		SenderName: name, Content: body.Text,
@@ -282,12 +282,4 @@ func atoiSafe(v string) int {
 		n = n*10 + int(c-'0')
 	}
 	return n
-}
-
-func maskPhone(p string) string {
-	p = strings.TrimSpace(p)
-	if len(p) <= 4 {
-		return "Listener"
-	}
-	return "…" + p[len(p)-4:]
 }

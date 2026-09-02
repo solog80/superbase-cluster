@@ -191,6 +191,9 @@ SMS_AGENT_KEY=          # shared secret between the TV-station agent and the mes
 
 ## 5. TV-station Windows SMS gateway (custom software)
 
+**Status: scaffolded** in a separate project — `myApps/sms-agent-windows`
+(.NET 8 console, runs under NSSM). See its README for build/install/config.
+
 Small always-on Windows service/agent (separate deliverable from the mesh). Responsibilities:
 
 1. **Modem I/O (AT commands)** over COM/USB:

@@ -100,7 +100,7 @@ func (s *server) insertInboundMessage(ctx context.Context, msg inboundMessage) (
 	row := map[string]any{
 		"id":                   id,
 		"room_id":              msg.RoomID,
-		"user_id":              nil,
+		"user_id":              externalUserID(msg.Channel, msg.ExternalID),
 		"user_name":            msg.SenderName,
 		"message_content":      msg.Content,
 		"is_admin_message":     false,
@@ -118,6 +118,19 @@ func (s *server) insertInboundMessage(ctx context.Context, msg inboundMessage) (
 	// Cache the external sender for reliable replies.
 	_ = s.upsertChannelContact(ctx, msg.Channel, msg.ExternalID, msg.SenderName)
 	return id, nil
+}
+
+// externalUserID builds a stable, non-null synthetic user id for inbound
+// external (SMS/WhatsApp) senders so the app can group bubbles per sender and
+// look them up (e.g. blocked-status) without crashing on a NULL user_id.
+func externalUserID(channel, externalID string) string {
+	clean := strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' {
+			return r
+		}
+		return '_'
+	}, externalID)
+	return "ext_" + channel + "_" + clean
 }
 
 func (s *server) upsertChannelContact(ctx context.Context, channel, externalID, name string) error {
