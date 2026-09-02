@@ -92,6 +92,7 @@ func main() {
 	mux.HandleFunc("/", s.dispatch)
 
 	s.startScheduler()
+	s.startChatScheduler()
 	s.startNotificationStaleCleanup()
 
 	port := getenv("PORT", "8080")
@@ -217,6 +218,8 @@ func (s *server) dispatch(w http.ResponseWriter, r *http.Request) {
 		s.trackWatchProgress(w, r)
 	case "batchTrackContentSessions":
 		s.trackContentSession(w, r)
+	case "processChatMessage":
+		s.handleProcessChatMessage(w, r)
 	case "getAnalyticsMetrics":
 		s.handleGetAnalyticsMetrics(w, r)
 	case "getFirebaseAnalytics":
