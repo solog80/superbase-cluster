@@ -236,7 +236,7 @@ func (s *server) notifyRoomInbound(ctx context.Context, roomID, programName, cha
 	if roomID == "" {
 		return
 	}
-	title := fmt.Sprintf("New %s in %s", channel, programName)
+	title := fmt.Sprintf("KaBox! %s", programName)
 	body := fmt.Sprintf("%s: %s", senderName, truncate(content, 120))
 	log.Printf("[inbound-notify] room=%s title=%q", roomID, title)
 
