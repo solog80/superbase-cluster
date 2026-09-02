@@ -143,12 +143,19 @@ func (s *server) dispatch(w http.ResponseWriter, r *http.Request) {
 		s.handleGetNewsArticles(w, r)
 	case "getNewsArticle":
 		s.handleGetNewsArticle(w, r)
-	case "createJoomlaArticle":
-		s.handleCreateJoomlaArticle(w, r)
-	case "updateJoomlaArticle":
-		s.handleUpdateJoomlaArticle(w, r)
-	case "deleteJoomlaArticle":
-		s.handleDeleteJoomlaArticle(w, r)
+	case "createJoomlaArticle", "updateJoomlaArticle", "deleteJoomlaArticle":
+		if !s.isServiceKey(r) {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"success": false, "error": "Unauthorized: Admin access required"})
+			return
+		}
+		switch name {
+		case "createJoomlaArticle":
+			s.handleCreateJoomlaArticle(w, r)
+		case "updateJoomlaArticle":
+			s.handleUpdateJoomlaArticle(w, r)
+		case "deleteJoomlaArticle":
+			s.handleDeleteJoomlaArticle(w, r)
+		}
 	case "getJoomlaReference":
 		s.handleGetJoomlaReference(w, r)
 	case "uploadNewsImage":
@@ -175,12 +182,21 @@ func (s *server) dispatch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.handleDeleteNewsImage(w, r)
-	case "getUsersPaginated":
+	case "createUser", "updateUserRole", "deleteUser", "getUsersPaginated":
 		if !s.isServiceKey(r) {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"success": false, "error": "Unauthorized: Admin access required"})
 			return
 		}
-		s.handleGetUsersPaginated(w, r)
+		switch name {
+		case "createUser":
+			s.handleCreateUser(w, r)
+		case "updateUserRole":
+			s.handleUpdateUserRole(w, r)
+		case "deleteUser":
+			s.handleDeleteUser(w, r)
+		case "getUsersPaginated":
+			s.handleGetUsersPaginated(w, r)
+		}
 	case "getAdMobile":
 		s.handleGetAdMobile(w, r)
 	case "batchTrackAdEvents":
