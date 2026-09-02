@@ -123,6 +123,7 @@ func (s *server) runRadioChatManager(ctx context.Context) error {
 	var activeID string
 	if ok {
 		activeID = generateSlug(active.ProgramName)
+		log.Printf("chat radio manager: active now = %s (%s)", activeID, active.ProgramName)
 		if err := s.upsertChatRoom(ctx, chatRoomRow{
 			ID: activeID, Kind: "radio", ProgramName: active.ProgramName, IsActive: true,
 			LastCleanedAt: &todayStr,
@@ -140,6 +141,7 @@ func (s *server) runRadioChatManager(ctx context.Context) error {
 	if activeID != "" {
 		filter = "kind=eq.radio,id=neq." + activeID
 	}
+	log.Printf("chat radio manager: deactivating (%s)", filter)
 	return s.restPatch(ctx, "chat_rooms", filter, map[string]any{"is_active": false})
 }
 
@@ -201,14 +203,47 @@ func (s *server) runTvChatManager(ctx context.Context) error {
 		}
 	}
 
-	// Deactivate TV rooms not currently active.
-	filter := "kind=eq.tv"
+	// Deactivate TV rooms not currently active. PostgREST PATCH does not apply
+	// reliably to `not.in(...)` filters (returns 204 with no rows changed), so
+	// resolve the explicit id list first, then PATCH by id=in.(...).
+	filter := "kind=eq.tv,is_active=eq.true"
 	if len(activeIDs) > 0 {
-		ids := make([]string, 0, len(activeIDs))
-		for id := range activeIDs {
-			ids = append(ids, id)
+		raw, _, err := s.doRest(ctx, "chat_rooms", url.Values{
+			"select": {"id"}, "kind": {"eq.tv"}, "is_active": {"eq.true"},
+			"limit": {"200"},
+		})
+		if err != nil {
+			return err
 		}
-		filter = "kind=eq.tv,not.and(id.in.(" + strings.Join(ids, ",") + "))"
+		var rows []struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(raw, &rows); err != nil {
+			return err
+		}
+		toDeactivate := make([]string, 0, len(rows))
+		for _, r := range rows {
+			if !activeIDs[r.ID] {
+				toDeactivate = append(toDeactivate, r.ID)
+			}
+		}
+		if len(toDeactivate) == 0 {
+			log.Printf("chat tv manager: nothing to deactivate")
+			return nil
+		}
+		// PostgREST in-list — split into batches to stay within URL limits.
+		for i := 0; i < len(toDeactivate); i += 50 {
+			end := i + 50
+			if end > len(toDeactivate) {
+				end = len(toDeactivate)
+			}
+			ids := strings.Join(toDeactivate[i:end], ",")
+			log.Printf("chat tv manager: deactivating %d room(s)", end-i)
+			if err := s.restPatch(ctx, "chat_rooms", "kind=eq.tv,id=in.("+ids+")", map[string]any{"is_active": false}); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 	return s.restPatch(ctx, "chat_rooms", filter, map[string]any{"is_active": false})
 }

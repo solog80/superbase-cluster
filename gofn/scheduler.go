@@ -131,12 +131,21 @@ func (s *server) startScheduler() {
 }
 
 // runEvery runs fn immediately after a short warmup, then on the interval.
+// Each invocation is wrapped in a recover so a transient panic in one manager
+// (e.g. a bad DB row) can't permanently kill the goroutine.
 func (s *server) runEvery(interval time.Duration, fn func(context.Context)) {
 	time.Sleep(2 * time.Second) // let the HTTP server + TSDB pool warm up
 	for {
-		ctx, cancel := context.WithTimeout(context.Background(), interval)
-		fn(ctx)
-		cancel()
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("scheduler panic in %v (recovered): %v", interval, r)
+				}
+			}()
+			ctx, cancel := context.WithTimeout(context.Background(), interval)
+			defer cancel()
+			fn(ctx)
+		}()
 		time.Sleep(interval)
 	}
 }
