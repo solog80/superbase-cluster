@@ -136,13 +136,43 @@ func (s *server) runRadioChatManager(ctx context.Context) error {
 		}
 	}
 
-	// Deactivate other radio rooms.
-	filter := "kind=eq.radio"
-	if activeID != "" {
-		filter = "kind=eq.radio,id=neq." + activeID
+	// Deactivate other radio rooms. PostgREST PATCH does not apply reliably to
+	// `neq`/`not.in` filters (intermittently returns 204 with no rows changed),
+	// so resolve the explicit id list first, then PATCH by id=in.(...).
+	raw, _, err = s.doRest(ctx, "chat_rooms", url.Values{
+		"select": {"id"}, "kind": {"eq.radio"}, "is_active": {"eq.true"},
+		"limit": {"200"},
+	})
+	if err != nil {
+		return err
 	}
-	log.Printf("chat radio manager: deactivating (%s)", filter)
-	return s.restPatch(ctx, "chat_rooms", filter, map[string]any{"is_active": false})
+	var activeRows []struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(raw, &activeRows); err != nil {
+		return err
+	}
+	toDeactivate := make([]string, 0, len(activeRows))
+	for _, r := range activeRows {
+		if r.ID != activeID {
+			toDeactivate = append(toDeactivate, r.ID)
+		}
+	}
+	if len(toDeactivate) == 0 {
+		return nil
+	}
+	for i := 0; i < len(toDeactivate); i += 50 {
+		end := i + 50
+		if end > len(toDeactivate) {
+			end = len(toDeactivate)
+		}
+		ids := strings.Join(toDeactivate[i:end], ",")
+		log.Printf("chat radio manager: deactivating %d room(s)", end-i)
+		if err := s.restPatch(ctx, "chat_rooms", "kind=eq.radio,id=in.("+ids+")", map[string]any{"is_active": false}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *server) runTvChatManager(ctx context.Context) error {
