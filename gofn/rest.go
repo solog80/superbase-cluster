@@ -55,7 +55,11 @@ func (s *server) restWrite(ctx context.Context, method, path, filter string, pay
 func (s *server) restRead(ctx context.Context, method, path, filter string, payload []byte, prefer string) ([]byte, http.Header, error) {
 	u := s.restURL + "/" + path
 	if filter != "" {
-		u += "?" + filter
+		// PostgREST accepts comma-joined predicates in ONE query param
+		// (e.g. "kind=eq.tv,id=in.(a,b)"), but the Envoy gateway on the mesh
+		// rejects that form and matches zero rows. Split top-level predicates
+		// into separate query params ("kind=eq.tv&id=in.(a,b)"), which works.
+		u += "?" + splitFilter(filter)
 	}
 	var body io.Reader
 	if payload != nil {
@@ -92,4 +96,33 @@ func nilOrJSON(v any) any {
 		return nil
 	}
 	return v
+}
+
+// splitFilter splits a PostgREST filter string on top-level commas into
+// separate "k=v" predicates joined with "&". Commas inside parentheses (e.g.
+// id=in.(a,b,c)) are preserved. This converts "kind=eq.tv,id=in.(a,b)" into
+// "kind=eq.tv&id=in.(a,b)" which the Envoy gateway/PostgREST applies reliably.
+func splitFilter(filter string) string {
+	var out []string
+	depth := 0
+	start := 0
+	for i := 0; i < len(filter); i++ {
+		switch filter[i] {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 {
+				out = append(out, filter[start:i])
+				start = i + 1
+			}
+		}
+	}
+	if start < len(filter) {
+		out = append(out, filter[start:])
+	}
+	return strings.Join(out, "&")
 }
