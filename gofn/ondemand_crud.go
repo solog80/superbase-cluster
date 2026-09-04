@@ -558,12 +558,21 @@ func (s *server) handleCreateSfxEpisode(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	// Next episode number.
+	// Next episode number. IDs may not be contiguous (e.g. a mirror previously
+	// created ep02 while ep01 is absent), so take the max existing _epNN suffix
+	// + 1 instead of counting rows.
 	episodeNum := 1
 	if raw, _, err := s.doRest(ctx, "episodes", url.Values{"select": {"id"}, "season_id": {"eq." + url.QueryEscape(seasonID)}}); err == nil {
 		var rows []struct{ ID string `json:"id"` }
 		if json.Unmarshal(raw, &rows) == nil {
-			episodeNum = len(rows) + 1
+			maxNum := 0
+			prefix := seasonID + "_ep"
+			for _, r := range rows {
+				if n, ok := parseEpisodeNum(r.ID, prefix); ok && n > maxNum {
+					maxNum = n
+				}
+			}
+			episodeNum = maxNum + 1
 		}
 	}
 	episodeID := fmt.Sprintf("%s_ep%02d", seasonID, episodeNum)
@@ -634,6 +643,20 @@ func randomHex(n int) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
+}
+
+// parseEpisodeNum extracts the numeric _epNN suffix from an episode id.
+// e.g. parseEpisodeNum("ug_parliament_s02_ep02", "ug_parliament_s02_ep") = 2.
+func parseEpisodeNum(id, prefix string) (int, bool) {
+	if !strings.HasPrefix(id, prefix) {
+		return 0, false
+	}
+	tail := strings.TrimPrefix(id, prefix)
+	var n int
+	if _, err := fmt.Sscanf(tail, "%d", &n); err != nil {
+		return 0, false
+	}
+	return n, true
 }
 
 func orStr(v, def string) string {
