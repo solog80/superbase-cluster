@@ -124,14 +124,9 @@ func (s *server) runRadioChatManager(ctx context.Context) error {
 	if ok {
 		activeID = generateSlug(active.ProgramName)
 		log.Printf("chat radio manager: active now = %s (%s)", activeID, active.ProgramName)
-		if err := s.upsertChatRoom(ctx, chatRoomRow{
+		if err := s.activateChatRoom(ctx, chatRoomRow{
 			ID: activeID, Kind: "radio", ProgramName: active.ProgramName, IsActive: true,
-			LastCleanedAt: &todayStr,
-		}); err != nil {
-			return err
-		}
-		// Clean messages on a new day (delete_chat != false).
-		if err := s.cleanRoomMessagesIfNewDay(ctx, activeID, todayStr); err != nil {
+		}, todayStr); err != nil {
 			return err
 		}
 	}
@@ -215,11 +210,10 @@ func (s *server) runTvChatManager(ctx context.Context) error {
 			generateSlug(st.ID), generateSlug(active.ProgramName), strings.ReplaceAll(active.StartTime, ":", ""))
 		activeIDs[tvProgramID] = true
 
-		if err := s.upsertChatRoom(ctx, chatRoomRow{
+		if err := s.activateChatRoom(ctx, chatRoomRow{
 			ID: tvProgramID, Kind: "tv", StationName: st.ID,
 			ProgramID: tvProgramID, ProgramName: active.ProgramName, IsActive: true,
-			LastCleanedAt: &todayStr,
-		}); err != nil {
+		}, todayStr); err != nil {
 			return err
 		}
 		// Persist tv_program_id on the EPG program so the app can use it.
@@ -227,9 +221,6 @@ func (s *server) runTvChatManager(ctx context.Context) error {
 			_ = s.restPatch(ctx, "epg_programs",
 				"station_id=eq."+url.QueryEscape(st.ID)+",program_name=eq."+url.QueryEscape(active.ProgramName)+",start_time=eq."+active.StartTime,
 				map[string]any{"tv_program_id": tvProgramID})
-		}
-		if err := s.cleanRoomMessagesIfNewDay(ctx, tvProgramID, todayStr); err != nil {
-			return err
 		}
 	}
 
@@ -313,7 +304,11 @@ func (s *server) upsertChatRoom(ctx context.Context, r chatRoomRow) error {
 	if json.Unmarshal(raw, &existing) == nil && len(existing) > 0 {
 		updates := map[string]any{
 			"kind": r.Kind, "is_active": r.IsActive, "program_name": r.ProgramName,
-			"last_cleaned_at": r.LastCleanedAt,
+		}
+		// Only touch last_cleaned_at when explicitly given, so an already-clean
+		// room isn't reset to NULL (which would trigger a re-clean next minute).
+		if r.LastCleanedAt != nil {
+			updates["last_cleaned_at"] = r.LastCleanedAt
 		}
 		if r.StationName != "" {
 			updates["station_name"] = r.StationName
@@ -326,19 +321,34 @@ func (s *server) upsertChatRoom(ctx context.Context, r chatRoomRow) error {
 	return s.restPostRow(ctx, "chat_rooms", row)
 }
 
-// cleanRoomMessagesIfNewDay deletes a room's messages once per day.
-func (s *server) cleanRoomMessagesIfNewDay(ctx context.Context, roomID, todayStr string) error {
-	raw, _, err := s.doRest(ctx, "chat_rooms", url.Values{"select": {"last_cleaned_at"}, "id": {"eq." + url.QueryEscape(roomID)}})
+// activateChatRoom marks a room active and, when a new day has started since it
+// was last cleaned, deletes its previous messages so each day starts fresh.
+// Order matters (mirrors Firebase scheduledChatManager): read the stored
+// last_cleaned_at BEFORE deleting, then stamp today — otherwise the room would
+// be marked "cleaned today" every minute and old messages would never be purged.
+func (s *server) activateChatRoom(ctx context.Context, r chatRoomRow, todayStr string) error {
+	// Read the stored clean date first (do not pre-stamp today).
+	raw, _, err := s.doRest(ctx, "chat_rooms", url.Values{"select": {"last_cleaned_at"}, "id": {"eq." + url.QueryEscape(r.ID)}})
 	if err != nil {
 		return err
 	}
 	var rows []struct {
 		LastCleanedAt *string `json:"last_cleaned_at"`
 	}
-	if json.Unmarshal(raw, &rows) == nil && len(rows) == 1 && rows[0].LastCleanedAt != nil && *rows[0].LastCleanedAt == todayStr {
-		return nil // already cleaned today
+	stored := ""
+	if json.Unmarshal(raw, &rows) == nil && len(rows) == 1 && rows[0].LastCleanedAt != nil {
+		stored = *rows[0].LastCleanedAt
 	}
-	return s.restDelete(ctx, "chat_messages", "room_id=eq."+url.QueryEscape(roomID))
+
+	if stored != todayStr {
+		// New day (or first activation): clear the previous day's messages.
+		if err := s.restDelete(ctx, "chat_messages", "room_id=eq."+url.QueryEscape(r.ID)); err != nil {
+			log.Printf("chat manager: delete messages for %s: %v", r.ID, err)
+		}
+		r.LastCleanedAt = &todayStr
+	}
+
+	return s.upsertChatRoom(ctx, r)
 }
 
 // ──────────────── PROCESS MESSAGE (participant + notifications) ────────────────
