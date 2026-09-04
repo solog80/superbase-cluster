@@ -19,9 +19,15 @@ import (
 // ──────────────── SUPABASE STORAGE (EPG images) ────────────────
 
 // uploadBase64Image decodes a data:image base64 payload, uploads it to the
-// Supabase Storage `epg-images` bucket under <station>/<orientation>/<name>,
-// and returns the public URL. Mirrors uploadImageToStorage.
+// Supabase Storage `epg-images` bucket under
+// [rootPrefix/]<station>/<orientation>/<name>, and returns the public URL.
+// Mirrors uploadImageToStorage. EPG program images use rootPrefix
+// "epg-programs" so they land in the browsable media library.
 func (s *server) uploadBase64Image(ctx context.Context, base64Data, stationName, orientation, originalFileName string) (string, error) {
+	return s.uploadBase64ImageRoot(ctx, "", base64Data, stationName, orientation, originalFileName)
+}
+
+func (s *server) uploadBase64ImageRoot(ctx context.Context, rootPrefix, base64Data, stationName, orientation, originalFileName string) (string, error) {
 	if base64Data == "" || stationName == "" {
 		return "", fmt.Errorf("base64 data and station name required")
 	}
@@ -48,6 +54,9 @@ func (s *server) uploadBase64Image(ctx context.Context, base64Data, stationName,
 		format = "svg+xml"
 	}
 	path := fmt.Sprintf("%s/%s/%s.%s", safeStation, orientation, fileName, format)
+	if rootPrefix != "" {
+		path = rootPrefix + "/" + path
+	}
 	mime := "image/" + format
 	if format == "svg+xml" {
 		mime = "image/svg+xml"
@@ -127,7 +136,7 @@ func (s *server) handleAddEPGProgram(w http.ResponseWriter, r *http.Request) {
 
 	// Handle image uploads (data:image base64 → storage).
 	if img, ok := body.Program.Image.(string); ok && strings.HasPrefix(img, "data:image") {
-		u, err := s.uploadBase64Image(ctx, img, body.StationName, "portrait", body.Program.ImageFileName)
+		u, err := s.uploadBase64ImageRoot(ctx, "epg-programs", img, body.StationName, "portrait", body.Program.ImageFileName)
 		if err != nil {
 			log.Printf("epg image upload: %v", err)
 		} else {
@@ -245,7 +254,7 @@ func (s *server) handleUpdateEPGProgram(w http.ResponseWriter, r *http.Request) 
 		}
 		if col == "image" || col == "thumbnail" {
 			if img, ok := v.(string); ok && strings.HasPrefix(img, "data:image") {
-				u, err := s.uploadBase64Image(ctx, img, body.StationName, "portrait", "")
+				u, err := s.uploadBase64ImageRoot(ctx, "epg-programs", img, body.StationName, "portrait", "")
 				if err != nil {
 					log.Printf("epg image upload: %v", err)
 				} else {

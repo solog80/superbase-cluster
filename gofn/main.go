@@ -170,25 +170,25 @@ func (s *server) dispatch(w http.ResponseWriter, r *http.Request) {
 		}
 	case "getJoomlaReference":
 		s.handleGetJoomlaReference(w, r)
-	case "uploadNewsImage":
+	case "uploadNewsImage", "uploadImage":
 		if !s.isServiceKey(r) {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"success": false, "error": "Unauthorized: Admin access required"})
 			return
 		}
 		s.handleUploadNewsImage(w, r)
-	case "listNewsImages":
+	case "listNewsImages", "listImages":
 		if !s.isServiceKey(r) {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"success": false, "error": "Unauthorized: Admin access required"})
 			return
 		}
 		s.handleListNewsImages(w, r)
-	case "createNewsFolder":
+	case "createNewsFolder", "createFolder":
 		if !s.isServiceKey(r) {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"success": false, "error": "Unauthorized: Admin access required"})
 			return
 		}
 		s.handleCreateNewsFolder(w, r)
-	case "deleteNewsImage":
+	case "deleteNewsImage", "deleteImage":
 		if !s.isServiceKey(r) {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"success": false, "error": "Unauthorized: Admin access required"})
 			return

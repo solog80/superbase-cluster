@@ -21,7 +21,6 @@ import (
 )
 
 const newsImageBucketPath = "epg-images"
-
 // newsImageMaxWidth is the target width for web-optimized article images.
 const newsImageMaxWidth = 1280
 
@@ -62,8 +61,8 @@ func (s *server) storageUpload(ctx context.Context, path, mime string, raw []byt
 
 // handleUploadNewsImage accepts a multipart image upload, resizes it for the
 // web, converts it to WebP, and stores it on the mesh storage under
-// news/<folder>/<id>.webp (folder defaults to <year>/<month>). The returned
-// public URL is what admin posts into Joomla.
+// <scope>/<folder>/<id>.webp (folder defaults to <year>/<month>, scope defaults
+// to "news"). The returned public URL is what admin posts into the target.
 func (s *server) handleUploadNewsImage(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseMultipartForm(25 << 20); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid multipart form: " + err.Error()})
@@ -75,6 +74,10 @@ func (s *server) handleUploadNewsImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer file.Close()
+	scope := sanitizeScope(r.FormValue("scope"))
+	if scope == "" {
+		scope = "news"
+	}
 	folder := sanitizeFolder(r.FormValue("folder"))
 	if folder == "" {
 		folder = fmt.Sprintf("%d/%02d", time.Now().Year(), time.Now().Month())
@@ -124,19 +127,34 @@ func (s *server) handleUploadNewsImage(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
-	path := "news/" + folder + "/" + id + ".webp"
+	path := scope + "/" + folder + "/" + id + ".webp"
 	ctx := r.Context()
 	url, err := s.storageUpload(ctx, path, "image/webp", out)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
-	log.Printf("[uploadNewsImage] %dx%d -> %s", dstW, dstH, url)
+	log.Printf("[uploadImage:%s] %dx%d -> %s", scope, dstW, dstH, url)
 	writeJSON(w, http.StatusOK, map[string]any{"url": url})
 }
 
+// sanitizeScope restricts a media-library scope root to a single safe slug
+// (e.g. "news", "epg-programs", "events", "notifications"). Only letters,
+// digits, '-', '_'. Returns "" if empty/invalid.
+func sanitizeScope(scope string) string {
+	scope = strings.Trim(strings.TrimSpace(scope), " /")
+	for _, r := range scope {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+		default:
+			return ""
+		}
+	}
+	return scope
+}
+
 // sanitizeFolder normalizes a user-supplied folder path so it stays inside the
-// news root and cannot traverse elsewhere.
+// scope root and cannot traverse elsewhere.
 func sanitizeFolder(f string) string {
 	f = strings.Trim(f, " /")
 	f = strings.ReplaceAll(f, "\\", "/")
@@ -157,15 +175,17 @@ func sanitizeFolder(f string) string {
 	return strings.Join(clean, "/")
 }
 
-// handleListNewsImages lists objects under the news/ prefix (folders included),
-// so admin can browse the media library and reuse existing images.
+// handleListNewsImages lists objects under a scope root (default news/),
+// folders included, so admin can browse the media library and reuse images.
 func (s *server) handleListNewsImages(w http.ResponseWriter, r *http.Request) {
+	scope := sanitizeScope(r.URL.Query().Get("scope"))
+	if scope == "" {
+		scope = "news"
+	}
 	folder := sanitizeFolder(r.URL.Query().Get("folder"))
-	prefix := "news"
+	prefix := scope + "/"
 	if folder != "" {
-		prefix = "news/" + folder + "/"
-	} else {
-		prefix = "news/"
+		prefix = scope + "/" + folder + "/"
 	}
 	offset := 0
 	fmt.Sscanf(r.URL.Query().Get("offset"), "%d", &offset)
@@ -195,9 +215,9 @@ func (s *server) handleListNewsImages(w http.ResponseWriter, r *http.Request) {
 		if isFolder {
 			// Folders come back as "2026" or "2026/"; normalize to a slash form.
 			name = strings.TrimSuffix(name, "/")
-			path = "news/" + folder + "/" + name + "/"
+			path = scope + "/" + folder + "/" + name + "/"
 			if folder == "" {
-				path = "news/" + name + "/"
+				path = scope + "/" + name + "/"
 			}
 		}
 		entry := map[string]any{
@@ -212,38 +232,45 @@ func (s *server) handleListNewsImages(w http.ResponseWriter, r *http.Request) {
 		}
 		images = append(images, entry)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"prefix": prefix, "folder": folder, "images": images, "offset": offset + len(objs)})
+	writeJSON(w, http.StatusOK, map[string]any{"scope": scope, "prefix": prefix, "folder": folder, "images": images, "offset": offset + len(objs)})
 }
 
-// handleCreateNewsFolder creates an empty folder under news/ by uploading a
-// zero-byte placeholder object. Supabase Storage materializes a folder as soon
-// as an object exists beneath it.
+// handleCreateNewsFolder creates an empty folder under a scope root (default
+// news/) by uploading a zero-byte placeholder object.
 func (s *server) handleCreateNewsFolder(w http.ResponseWriter, r *http.Request) {
 	var body struct {
+		Scope  string `json:"scope"`
 		Folder string `json:"folder"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid body"})
 		return
 	}
+	scope := sanitizeScope(body.Scope)
+	if scope == "" {
+		scope = "news"
+	}
 	folder := sanitizeFolder(body.Folder)
 	if folder == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "folder is required"})
 		return
 	}
-	path := "news/" + folder + "/.keep"
+	path := scope + "/" + folder + "/.keep"
 	if _, err := s.storageUpload(r.Context(), path, "application/octet-stream", nil); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
-	log.Printf("[createNewsFolder] %s", folder)
-	writeJSON(w, http.StatusOK, map[string]any{"success": true, "folder": folder})
+	log.Printf("[createNewsFolder] %s/%s", scope, folder)
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "scope": scope, "folder": folder})
 }
 
-// handleDeleteNewsImage deletes an image object from the news media library.
+// handleDeleteNewsImage deletes an image object from a scope's media library.
+// Path may be "<scope>/<folder>/<file>" or "news/..." (legacy). An explicit
+// scope body field overrides the first path segment.
 func (s *server) handleDeleteNewsImage(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Path string `json:"path"`
+		Scope string `json:"scope"`
+		Path  string `json:"path"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid body"})
@@ -251,9 +278,26 @@ func (s *server) handleDeleteNewsImage(w http.ResponseWriter, r *http.Request) {
 	}
 	path := strings.Trim(body.Path, " /")
 	path = strings.ReplaceAll(path, "\\", "/")
-	if !strings.HasPrefix(path, "news/") {
-		path = "news/" + path
+
+	// Determine the scope root: explicit scope wins, else the first path segment.
+	scope := sanitizeScope(body.Scope)
+	if scope == "" {
+		parts := strings.SplitN(path, "/", 2)
+		if len(parts) == 2 && sanitizeScope(parts[0]) != "" {
+			scope = sanitizeScope(parts[0])
+			path = parts[1]
+		} else {
+			scope = "news"
+		}
 	}
+	if scope == "" {
+		scope = "news"
+	}
+	// Strip a redundant scope prefix from the path if present.
+	if seg := strings.SplitN(path, "/", 2); len(seg) == 2 && sanitizeScope(seg[0]) == scope {
+		path = seg[1]
+	}
+
 	parts := strings.Split(path, "/")
 	var clean []string
 	for _, p := range parts {
@@ -266,11 +310,11 @@ func (s *server) handleDeleteNewsImage(w http.ResponseWriter, r *http.Request) {
 		}
 		clean = append(clean, p)
 	}
-	if len(clean) < 2 {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "path must include news/<file> or news/<folder>/<file>"})
+	if len(clean) < 1 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "path must include a file under the scope"})
 		return
 	}
-	path = strings.Join(clean, "/")
+	path = scope + "/" + strings.Join(clean, "/")
 
 	storageURL := s.restURL
 	if i := strings.Index(storageURL, "/rest/v1"); i >= 0 {
