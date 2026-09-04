@@ -392,6 +392,9 @@ func (s *server) handleDeleteOnDemandEpisode(w http.ResponseWriter, r *http.Requ
 
 // handleCreateSfxEpisode mirrors createSfxEpisode: creates an episode (and
 // season if needed) for an SFX (objects.solofx.net) video after TUS upload.
+// Also serves Bunny episodes: pass server="bunny" with a Bunny videoId (or
+// bunnyGuid + videoUrl/thumbnail/duration) — the mesh is authoritative and the
+// dashboard mirrors to Firestore afterwards (mesh-first dual write).
 func (s *server) handleCreateSfxEpisode(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		ShowID      string `json:"showId"`
@@ -405,6 +408,10 @@ func (s *server) handleCreateSfxEpisode(w http.ResponseWriter, r *http.Request) 
 		SeasonTitle string `json:"seasonTitle"`
 		Published   *bool  `json:"published"`
 		Processing  *bool  `json:"processing"`
+		// Bunny fields (server="bunny" path).
+		Server    string `json:"server"`    // "sfx" (default) | "bunny"
+		VideoID   string `json:"videoId"`   // Bunny video GUID to poll
+		BunnyGUID string `json:"bunnyGuid"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 2<<20)).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid body: " + err.Error()})
@@ -415,8 +422,54 @@ func (s *server) handleCreateSfxEpisode(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
 	defer cancel()
+
+	// Bunny path: poll Bunny for metadata when a videoId is supplied and no
+	// videoUrl/duration/thumbnail were passed through.
+	server := strings.ToLower(body.Server)
+	if server != "bunny" && server != "" && server != "sfx" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "server must be 'sfx' or 'bunny'"})
+		return
+	}
+	if server == "" {
+		server = "sfx"
+	}
+	if server == "bunny" {
+		bunnyGuid := body.BunnyGUID
+		if bunnyGuid == "" {
+			bunnyGuid = body.VideoID
+		}
+		if bunnyGuid == "" && body.VideoURL == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "videoId/bunnyGuid or videoUrl required for bunny episodes"})
+			return
+		}
+		// If the caller only gave us a Bunny GUID (not final URLs), poll Bunny
+		// for the ready video (mirrors the old Firebase createEpisodeFromBunnyUpload).
+		if body.VideoURL == "" {
+			v, err := fetchBunnyVideo(s.client, bunnyGuid)
+			if err != nil {
+				writeJSON(w, http.StatusBadGateway, map[string]any{"error": "bunny: " + err.Error()})
+				return
+			}
+			host := bunnyCDNHostname()
+			if v.Hostname != "" {
+				host = v.Hostname
+			}
+			body.VideoURL = fmt.Sprintf("https://%s/%s/playlist.m3u8", host, v.GUID)
+			thumbFile := v.ThumbnailFileName
+			if thumbFile == "" {
+				thumbFile = "thumbnail.jpg"
+			}
+			body.Thumbnail = fmt.Sprintf("https://%s/%s/%s", host, v.GUID, thumbFile)
+			body.Duration = int(v.Length)
+			body.BunnyGUID = v.GUID
+			if body.Title == "" {
+				body.Title = v.Title
+			}
+		}
+		body.VideoID = ""
+	}
 
 	// Resolve show slug for ID generation.
 	showSlug := generateSlug(body.ShowID)
@@ -529,7 +582,9 @@ func (s *server) handleCreateSfxEpisode(w http.ResponseWriter, r *http.Request) 
 		"title": body.Title, "description": body.Description,
 		"duration": body.Duration, "thumbnail": orStr(body.Thumbnail, ""),
 		"video_url": body.VideoURL, "sfx_job_name": orStr(body.SfxJobName, ""),
-		"server": "sfx", "published": published, "processing": processing,
+		"server": server,
+		"bunny_guid": nilOrEmpty(body.BunnyGUID),
+		"published": published, "processing": processing,
 		"date_uploaded": now, "air_date": now,
 		"created_at": now, "updated_at": now,
 	}
@@ -549,7 +604,13 @@ func (s *server) handleCreateSfxEpisode(w http.ResponseWriter, r *http.Request) 
 	s.clearOndemandCache()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"success": true,
-		"episode": map[string]any{"id": episodeID, "seasonId": seasonID, "showId": body.ShowID},
+		"episode": map[string]any{
+			"id": episodeID, "seasonId": seasonID, "showId": body.ShowID,
+			"title": body.Title, "description": body.Description,
+			"videoUrl": body.VideoURL, "thumbnail": body.Thumbnail,
+			"duration": body.Duration, "server": server, "bunnyGuid": body.BunnyGUID,
+			"seasonTitle": body.SeasonTitle,
+		},
 		"message": "Episode created successfully",
 	})
 }

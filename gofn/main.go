@@ -356,7 +356,7 @@ func (s *server) dispatch(w http.ResponseWriter, r *http.Request) {
 	case "createOnDemandShow", "updateOnDemandShow", "deleteOnDemandShow",
 		"createOnDemandSeason", "updateOnDemandSeason", "deleteOnDemandSeason",
 		"updateOnDemandEpisode", "deleteOnDemandEpisode",
-		"createSfxEpisode", "getEpisodePlaybackUrl", "uploadShowPoster",
+		"createSfxEpisode", "createEpisodeFromBunnyUpload", "getEpisodePlaybackUrl", "uploadShowPoster",
 		"refreshOnDemandCache", "scheduleOnDemandCacheRefresh":
 		if !s.isServiceKey(r) {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"success": false, "error": "Unauthorized: Admin access required"})
@@ -379,7 +379,7 @@ func (s *server) dispatch(w http.ResponseWriter, r *http.Request) {
 			s.handleUpdateOnDemandEpisode(w, r)
 		case "deleteOnDemandEpisode":
 			s.handleDeleteOnDemandEpisode(w, r)
-		case "createSfxEpisode":
+		case "createSfxEpisode", "createEpisodeFromBunnyUpload":
 			s.handleCreateSfxEpisode(w, r)
 		case "getEpisodePlaybackUrl":
 			s.handleGetEpisodePlaybackUrl(w, r)
