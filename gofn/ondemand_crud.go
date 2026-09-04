@@ -433,7 +433,38 @@ func (s *server) handleCreateSfxEpisode(w http.ResponseWriter, r *http.Request) 
 	var seasonID string
 	switch {
 	case body.SeasonID != "":
+		// Season id supplied (e.g. the Firestore mirror passes a precomputed id).
+		// If it already exists in Supabase, reuse it. Otherwise create it here —
+		// the Firestore side may have created the season in Firestore only, and
+		// blindly inserting the episode would violate the seasons FK (500).
 		seasonID = body.SeasonID
+		if raw, _, err := s.doRest(ctx, "seasons", url.Values{"select": {"id"}, "id": {"eq." + url.QueryEscape(seasonID)}}); err == nil {
+			var rows []struct{ ID string `json:"id"` }
+			if json.Unmarshal(raw, &rows) == nil && len(rows) == 1 {
+				// exists — reuse
+				break
+			}
+		}
+		title := body.SeasonTitle
+		if title == "" {
+			title = seasonID
+		}
+		var nextOrder int = 1
+		if raw, _, err := s.doRest(ctx, "seasons", url.Values{"select": {"ord"}, "show_id": {"eq." + url.QueryEscape(body.ShowID)}, "order": {"ord.desc"}, "limit": {"1"}}); err == nil {
+			var rows []struct{ Ord int `json:"ord"` }
+			if json.Unmarshal(raw, &rows) == nil && len(rows) == 1 {
+				nextOrder = rows[0].Ord + 1
+			}
+		}
+		seasonRow := map[string]any{
+			"id": seasonID, "show_id": body.ShowID, "title": title,
+			"ord": nextOrder, "episode_count": 0, "published": true,
+			"created_at": now, "updated_at": now,
+		}
+		if err := s.restPostRow(ctx, "seasons", seasonRow); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
 	case body.SeasonTitle != "":
 		var nextOrder int = 1
 		if raw, _, err := s.doRest(ctx, "seasons", url.Values{"select": {"ord"}, "show_id": {"eq." + url.QueryEscape(body.ShowID)}, "order": {"ord.desc"}, "limit": {"1"}}); err == nil {
