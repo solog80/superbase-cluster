@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -57,7 +59,7 @@ func (s *server) handleAddEvent(w http.ResponseWriter, r *http.Request) {
 		Platform  string   `json:"platform"`
 		Stations  []string `json:"stations"`
 	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, 10<<20)).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid body: " + err.Error()})
 		return
 	}
@@ -66,7 +68,24 @@ func (s *server) handleAddEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// If the caller uploaded an image (data:image base64), store it to Supabase
+	// Storage and persist the public URL, mirroring EPG program images.
+	if strings.HasPrefix(body.ImageURL, "data:image") {
+		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+		defer cancel()
+		u, err := s.uploadBase64Image(ctx, body.ImageURL, "events", "landscape", "")
+		if err != nil {
+			log.Printf("addEvent: image upload failed: %v", err)
+		} else {
+			body.ImageURL = u
+		}
+	}
+
 	now := time.Now().UTC().Format(time.RFC3339)
+	stations := body.Stations
+	if stations == nil {
+		stations = []string{}
+	}
 	row := map[string]any{
 		"title":      body.Title,
 		"image_url":  body.ImageURL,
@@ -74,7 +93,7 @@ func (s *server) handleAddEvent(w http.ResponseWriter, r *http.Request) {
 		"start_date": body.StartDate,
 		"end_date":   body.EndDate,
 		"platform":   body.Platform,
-		"stations":   body.Stations,
+		"stations":   stations,
 		"created_at": now,
 		"updated_at": now,
 	}
@@ -99,7 +118,7 @@ func (s *server) handleUpdateEvent(w http.ResponseWriter, r *http.Request) {
 		Platform  *string  `json:"platform"`
 		Stations  []string `json:"stations"`
 	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, 10<<20)).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid body: " + err.Error()})
 		return
 	}
@@ -113,6 +132,17 @@ func (s *server) handleUpdateEvent(w http.ResponseWriter, r *http.Request) {
 		row["title"] = *body.Title
 	}
 	if body.ImageURL != nil {
+		// Upload base64 image payloads to storage and persist the public URL.
+		if strings.HasPrefix(*body.ImageURL, "data:image") {
+			ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+			defer cancel()
+			u, err := s.uploadBase64Image(ctx, *body.ImageURL, "events", "landscape", "")
+			if err != nil {
+				log.Printf("updateEvent: image upload failed: %v", err)
+			} else {
+				*body.ImageURL = u
+			}
+		}
 		row["image_url"] = *body.ImageURL
 	}
 	if body.Presenter != nil {
