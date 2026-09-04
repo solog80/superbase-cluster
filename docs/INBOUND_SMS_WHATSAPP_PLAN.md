@@ -3,7 +3,8 @@
 **Status:** PLANNING (locked decisions below; providers/hardware on TV-station side)
 **Repo / runtime:** `superbase-cluster/gofn` (mesh on Edge, `edge.solofx.net`)
 **Related:** chat already lives on the mesh (`gofn/chat.go`); chat tables = `005_chat.sql`
-(radio/tv `chat_rooms`, `chat_messages`, `chat_participants`).
+(radio/tv `chat_rooms`, `chat_messages`, `chat_participants`). Room activation/deactivation
++ the per-day message clear + the `delete_chat` keep-chat opt-out are described in §0 below.
 
 The goal: **listeners/viewers send an SMS or a WhatsApp message to a published number and
 that message lands in the program chat room currently airing** (radio + each TV station).
@@ -23,9 +24,42 @@ Firebase chat functions still active during migration).
 - Stations: **1 radio** (`Live_Radio`), **3 TV** (`Salt TV One`, `Salt TV Two`, `event`).
 - App reads chat via Supabase realtime (`chat_messages`), Firestore fallback; sends via
   Firestore + dual-write to Supabase + `processChatMessage` on the mesh.
-- Mesh room managers (`chat.go`) recompute the active room every minute from `epg_programs`
-  (`activeProgramAt`).
-- No SMS/WhatsApp code exists anywhere (Flutter app, admin, mesh, or Firebase functions).
+- Mesh room managers (`chat.go`, `startChatScheduler`) recompute the active room(s) every
+  minute from `epg_programs` (`activeProgramAt`). Per run they:
+  1. activate the room for the **currently airing** program per station
+     (`activateChatRoom` → upsert `is_active=true`);
+  2. **deactivate** every other active room of that kind
+     (radio: all but the one live radio room; TV: all but one per station).
+  So `is_active` is a point-in-time "live now" flag (radio ≤ 1, TV ≤ 1/station), NOT
+  "ever-on today". Rooms are created lazily when their program first airs and persist as
+  inactive rows afterwards.
+
+### Room lifecycle: daily clear + keep-chat opt-out
+
+- Each UTC day, the first activation of a room **clears its previous messages** so a room
+  starts fresh at its next airing (mirrors Firebase `scheduledChatManager.js` /
+  `scheduledTvChatManager.js`). Tracking column: `chat_rooms.last_cleaned_at` (a date).
+- `activateChatRoom` reads the **stored** `last_cleaned_at` first; if it is not today it
+  deletes that room's `chat_messages` rows, then stamps today. (Ordering matters: stamping
+  before checking would make every run look "already cleaned" and old messages would never
+  be purged.)
+- **Keep-chat opt-out:** a program can set `epg_programs.delete_chat = false` to keep its
+  chat history across days (no per-day wipe). Semantics match Firebase `deleteChat`:
+  - `delete_chat IS NULL` or `true` → clear each new day (default)
+  - `delete_chat = false` → keep messages across days (only the clean marker advances)
+  - Currently only **`Salt TV One` / `Connected` (10:00 Mon–Fri)** is set to `false`.
+  Column added by `superbase-cluster/migrations/011_chat_delete_chat.sql`; EPG add/update
+  CRUD carries `deleteChat`.
+- **Gotcha (fixed):** PostgREST *comma-joined* filters (`kind=eq.tv,id=in.(a,b)`) silently
+  matched **zero rows** through the mesh's Envoy gateway, so room deactivation (and the SMS
+  outbox claim, see §4.2) were no-ops. `rest.go restRead` now splits top-level predicates
+  into separate query params (`kind=eq.tv&id=in.(a,b)`), which PostgREST applies reliably.
+  Do NOT reintroduce comma-joined filters in `restPatch`/`restDelete` calls.
+- **SMS:** mesh-side endpoints are live (`gofn/sms.go`: `smsInbound`, `smsOutboxPoll`,
+  `smsOutboxReport`, HMAC `X-Agent-Key`) with the migration applied
+  (`010_inbound_channels.sql`); the TV-station Windows gateway is scaffolded in a separate
+  project (`myApps/sms-agent-windows`). **WhatsApp: not built** (no `whatsapp.go`; no WABA
+  wiring yet) — §1.2 remains the plan for it.
 
 ---
 
