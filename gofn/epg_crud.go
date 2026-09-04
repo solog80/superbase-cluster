@@ -102,6 +102,7 @@ type epgProgramWrite struct {
 	Thumbnail      any    `json:"thumbnail"`
 	TargetAudence  any    `json:"targetAudence"`
 	TvProgramID    any    `json:"tvProgramId"`
+	DeleteChat     any    `json:"deleteChat"`
 	ImageFileName  string `json:"imageFileName"`
 }
 
@@ -156,6 +157,7 @@ func (s *server) handleAddEPGProgram(w http.ResponseWriter, r *http.Request) {
 		"thumbnail":      nilOrJSON(body.Program.Thumbnail),
 		"target_audience": nilOrJSON(body.Program.TargetAudence),
 		"tv_program_id":  nilOrJSON(body.Program.TvProgramID),
+		"delete_chat":    nilOrJSON(body.Program.DeleteChat),
 		"updated_at":     time.Now().UTC().Format(time.RFC3339),
 	}
 
@@ -233,6 +235,7 @@ func (s *server) handleUpdateEPGProgram(w http.ResponseWriter, r *http.Request) 
 		"details": "details", "language": "language", "startTime": "start_time",
 		"endTime": "end_time", "days": "days", "type": "type", "image": "image",
 		"thumbnail": "thumbnail", "targetAudence": "target_audience", "tvProgramId": "tv_program_id",
+		"deleteChat": "delete_chat",
 	}
 	row := map[string]any{}
 	for k, v := range body.Updates {

@@ -31,7 +31,7 @@ type epgProgramRow struct {
 	EndTime     string `json:"end_time"`
 	Days        string `json:"days"`
 	TvProgramID string `json:"tv_program_id"`
-	DeleteChat  *bool  `json:"delete_chat,omitempty"`
+	DeleteChat  *bool  `json:"delete_chat"`
 }
 
 // ──────────────── SCHEDULED ROOM MANAGERS ────────────────
@@ -102,7 +102,7 @@ func activeProgramAt(programs []epgProgramRow, nowUtc time.Time) (epgProgramRow,
 func (s *server) runRadioChatManager(ctx context.Context) error {
 	// Read the radio lineup (Live_Radio station + its programs).
 	raw, _, err := s.doRest(ctx, "epg_programs", url.Values{
-		"select":     {"program_name,start_time,end_time,days,tv_program_id"},
+		"select":     {"program_name,start_time,end_time,days,tv_program_id,delete_chat"},
 		"station_id": {"eq.Live_Radio"},
 	})
 	if err != nil {
@@ -126,7 +126,7 @@ func (s *server) runRadioChatManager(ctx context.Context) error {
 		log.Printf("chat radio manager: active now = %s (%s)", activeID, active.ProgramName)
 		if err := s.activateChatRoom(ctx, chatRoomRow{
 			ID: activeID, Kind: "radio", ProgramName: active.ProgramName, IsActive: true,
-		}, todayStr); err != nil {
+		}, todayStr, active.keepsChat()); err != nil {
 			return err
 		}
 	}
@@ -192,7 +192,7 @@ func (s *server) runTvChatManager(ctx context.Context) error {
 
 	for _, st := range stations {
 		raw, _, err := s.doRest(ctx, "epg_programs", url.Values{
-			"select":     {"program_name,start_time,end_time,days,tv_program_id"},
+			"select":     {"program_name,start_time,end_time,days,tv_program_id,delete_chat"},
 			"station_id": {"eq." + st.ID},
 		})
 		if err != nil {
@@ -213,7 +213,7 @@ func (s *server) runTvChatManager(ctx context.Context) error {
 		if err := s.activateChatRoom(ctx, chatRoomRow{
 			ID: tvProgramID, Kind: "tv", StationName: st.ID,
 			ProgramID: tvProgramID, ProgramName: active.ProgramName, IsActive: true,
-		}, todayStr); err != nil {
+		}, todayStr, active.keepsChat()); err != nil {
 			return err
 		}
 		// Persist tv_program_id on the EPG program so the app can use it.
@@ -279,6 +279,13 @@ type chatRoomRow struct {
 	LastCleanedAt *string
 }
 
+// keepsChat reports whether a program's chat history should survive the daily
+// new-day clear. Mirrors Firebase: delete_chat = false keeps the chat; NULL or
+// true clears it each new day.
+func (p epgProgramRow) keepsChat() bool {
+	return p.DeleteChat != nil && !*p.DeleteChat
+}
+
 // upsertChatRoom inserts or updates a room row by id.
 func (s *server) upsertChatRoom(ctx context.Context, r chatRoomRow) error {
 	row := map[string]any{
@@ -322,11 +329,12 @@ func (s *server) upsertChatRoom(ctx context.Context, r chatRoomRow) error {
 }
 
 // activateChatRoom marks a room active and, when a new day has started since it
-// was last cleaned, deletes its previous messages so each day starts fresh.
+// was last cleaned, deletes its previous messages so each day starts fresh —
+// unless the program opts to keep its chat history (keep = true).
 // Order matters (mirrors Firebase scheduledChatManager): read the stored
 // last_cleaned_at BEFORE deleting, then stamp today — otherwise the room would
 // be marked "cleaned today" every minute and old messages would never be purged.
-func (s *server) activateChatRoom(ctx context.Context, r chatRoomRow, todayStr string) error {
+func (s *server) activateChatRoom(ctx context.Context, r chatRoomRow, todayStr string, keep bool) error {
 	// Read the stored clean date first (do not pre-stamp today).
 	raw, _, err := s.doRest(ctx, "chat_rooms", url.Values{"select": {"last_cleaned_at"}, "id": {"eq." + url.QueryEscape(r.ID)}})
 	if err != nil {
@@ -341,9 +349,15 @@ func (s *server) activateChatRoom(ctx context.Context, r chatRoomRow, todayStr s
 	}
 
 	if stored != todayStr {
-		// New day (or first activation): clear the previous day's messages.
-		if err := s.restDelete(ctx, "chat_messages", "room_id=eq."+url.QueryEscape(r.ID)); err != nil {
-			log.Printf("chat manager: delete messages for %s: %v", r.ID, err)
+		if keep {
+			// Program keeps its chat history across days: still advance the
+			// clean marker so this only runs once, but do not delete messages.
+			log.Printf("chat manager: %s keeps chat history (delete_chat=false); skipping clear", r.ID)
+		} else {
+			// New day (or first activation): clear the previous day's messages.
+			if err := s.restDelete(ctx, "chat_messages", "room_id=eq."+url.QueryEscape(r.ID)); err != nil {
+				log.Printf("chat manager: delete messages for %s: %v", r.ID, err)
+			}
 		}
 		r.LastCleanedAt = &todayStr
 	}
