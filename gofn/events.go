@@ -31,6 +31,10 @@ func (s *server) handleGetEvents(w http.ResponseWriter, r *http.Request) {
 	// Convert snake_case → camelCase to match the old Firestore shape.
 	events := make([]map[string]any, 0, len(rows))
 	for _, row := range rows {
+		enableChat := true
+		if ec, ok := row["enable_chat"].(bool); ok {
+			enableChat = ec
+		}
 		events = append(events, map[string]any{
 			"id":         row["id"],
 			"title":      row["title"],
@@ -40,6 +44,7 @@ func (s *server) handleGetEvents(w http.ResponseWriter, r *http.Request) {
 			"endDate":    row["end_date"],
 			"platform":   row["platform"],
 			"stations":   row["stations"],
+			"enableChat": enableChat,
 			"createdAt":  row["created_at"],
 			"updatedAt":  row["updated_at"],
 		})
@@ -51,13 +56,14 @@ func (s *server) handleGetEvents(w http.ResponseWriter, r *http.Request) {
 // cache.
 func (s *server) handleAddEvent(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Title     string   `json:"title"`
-		ImageURL  string   `json:"imageUrl"`
-		Presenter string   `json:"presenter"`
-		StartDate string   `json:"startDate"`
-		EndDate   string   `json:"endDate"`
-		Platform  string   `json:"platform"`
-		Stations  []string `json:"stations"`
+		Title      string   `json:"title"`
+		ImageURL   string   `json:"imageUrl"`
+		Presenter  string   `json:"presenter"`
+		StartDate  string   `json:"startDate"`
+		EndDate    string   `json:"endDate"`
+		Platform   string   `json:"platform"`
+		Stations   []string `json:"stations"`
+		EnableChat *bool    `json:"enableChat"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 10<<20)).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid body: " + err.Error()})
@@ -86,16 +92,21 @@ func (s *server) handleAddEvent(w http.ResponseWriter, r *http.Request) {
 	if stations == nil {
 		stations = []string{}
 	}
+	enableChat := true
+	if body.EnableChat != nil {
+		enableChat = *body.EnableChat
+	}
 	row := map[string]any{
-		"title":      body.Title,
-		"image_url":  body.ImageURL,
-		"presenter":  body.Presenter,
-		"start_date": body.StartDate,
-		"end_date":   body.EndDate,
-		"platform":   body.Platform,
-		"stations":   stations,
-		"created_at": now,
-		"updated_at": now,
+		"title":       body.Title,
+		"image_url":   body.ImageURL,
+		"presenter":   body.Presenter,
+		"start_date":  body.StartDate,
+		"end_date":    body.EndDate,
+		"platform":    body.Platform,
+		"stations":    stations,
+		"enable_chat": enableChat,
+		"created_at":  now,
+		"updated_at":  now,
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
@@ -109,14 +120,15 @@ func (s *server) handleAddEvent(w http.ResponseWriter, r *http.Request) {
 // handleUpdateEvent mirrors updateEvent: updates an event by id.
 func (s *server) handleUpdateEvent(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		EventID   string   `json:"eventId"`
-		Title     *string  `json:"title"`
-		ImageURL  *string  `json:"imageUrl"`
-		Presenter *string  `json:"presenter"`
-		StartDate *string  `json:"startDate"`
-		EndDate   *string  `json:"endDate"`
-		Platform  *string  `json:"platform"`
-		Stations  []string `json:"stations"`
+		EventID    string   `json:"eventId"`
+		Title      *string  `json:"title"`
+		ImageURL   *string  `json:"imageUrl"`
+		Presenter  *string  `json:"presenter"`
+		StartDate  *string  `json:"startDate"`
+		EndDate    *string  `json:"endDate"`
+		Platform   *string  `json:"platform"`
+		Stations   []string `json:"stations"`
+		EnableChat *bool    `json:"enableChat"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 10<<20)).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid body: " + err.Error()})
@@ -156,6 +168,9 @@ func (s *server) handleUpdateEvent(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.Platform != nil {
 		row["platform"] = *body.Platform
+	}
+	if body.EnableChat != nil {
+		row["enable_chat"] = *body.EnableChat
 	}
 	if body.Stations != nil {
 		row["stations"] = body.Stations
