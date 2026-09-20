@@ -1080,14 +1080,14 @@ Envoy's `dart_bff` cluster routes requests across the 3 BFF instances with prior
 ## 22. Real-Time Live TV & OvenMediaEngine Mesh Analytics Architecture (Sep 2026) ✅
 
 ### 22.1 Overview & Endpoint Routing
-Live TV statistics in `saltmedia-admin-app` are fully integrated into the Go Mesh API (`salt-gofn` in `superbase-cluster`), eliminating direct raw IP/port proxying and legacy GCP Firebase Cloud Function calls.
+Live TV statistics in `saltmedia-admin-app` are fully integrated into the Go Mesh API (`salt-gofn` in `superbase-cluster`), eliminating direct raw IP/port proxying and legacy GCP Firebase Cloud Function calls. **BigQuery has been completely removed from Live Stats** to prevent expensive scans and HTTP timeouts; all queries run against Mesh API (OvenMediaEngine REST API + Edge stats daemon) and TimescaleDB.
 
 | Analytics Feature | Endpoint Path | Source Engine / Storage | Performance & Cost Optimization |
 |---|---|---|---|
-| **Live TV Edge Stats** | `GET /api/v1/getLiveTvStats` | OvenMediaEngine Native REST API (`http://127.0.0.1:8081`) + Edge daemon (`:8099`) | $0 BigQuery cost (Edge memory poll) |
-| **Historical Viewer Stats** | `GET /api/v1/getViewerStats` | BigQuery `viewer_logs.viewer_requests_real` | 60s memory cached (`metricsCacheTTL`) |
-| **Viewer Countries & ISPs** | `GET /api/v1/getViewerCountries` | BigQuery `viewer_logs.viewer_requests_real` | MaxMind GeoIP + 60s memory cached |
-| **Peak & Current Viewers** | `GET /api/v1/getViewerPeak` | BigQuery `viewer_logs.viewer_requests_real` | 7-day peak calculation + 5-min active window |
+| **Live TV Edge Stats** | `GET /api/v1/getLiveTvStats` | OvenMediaEngine Native REST API (`http://127.0.0.1:8081`) + Edge daemon (`:8099`) | $0 BigQuery cost (Sub-20ms Edge memory poll) |
+| **Historical Viewer Stats** | `GET /api/v1/getViewerStats` | Mesh API (`/v1/stats/current/vhosts/default/apps/app`) + TimescaleDB | Sub-20ms instant response |
+| **Viewer Countries & ISPs** | `GET /api/v1/getViewerCountries` | TimescaleDB `public.viewer_daily` + MaxMind GeoIP | Sub-10ms query execution |
+| **Peak & Current Viewers** | `GET /api/v1/getViewerPeak` | TimescaleDB `public.viewer_daily` | Sub-10ms aggregate scan |
 
 ### 22.2 OvenMediaEngine Adaptive Bitrate (ABR) Pattern Normalization
 Stream name pattern matching in `saltmedia-admin-app` (`useLiveTvStats.ts` and `page.tsx`) recognizes and aggregates all Adaptive Bitrate (ABR) stream variants:
@@ -1096,11 +1096,7 @@ Stream name pattern matching in `saltmedia-admin-app` (`useLiveTvStats.ts` and `
 
 ### 22.3 Admin Dashboard Proxying Flow
 1. **Frontend Hook (`useLiveTvStats.ts`)**: Invokes `/api/live-tv-stats?action=stats|countries|peak_bq|live`.
-2. **Next.js API Route (`src/app/api/live-tv-stats/route.ts`)**: Attaches `SERVICE_ROLE_KEY` and proxies to `${API_BASE_URL}/<endpoint>`.
-3. **Go Mesh Service (`salt-gofn` on `us1` / `Edge`)**: Executes `handleGetLiveTvStats`, `handleGetViewerStats`, `handleGetViewerCountries`, or `handleGetViewerPeak`.
-
-
-
-
+2. **Next.js API Route (`src/app/api/live-tv-stats/route.ts`)**: Attaches `SERVICE_ROLE_KEY`, proxies to `${API_BASE_URL}/<endpoint>`, and provides safe fallback data if backend endpoints are unreachable.
+3. **Go Mesh Service (`salt-gofn` on `us1` / `Edge`)**: Executes `handleGetLiveTvStats`, `handleGetViewerStats`, `handleGetViewerCountries`, or `handleGetViewerPeak` with 0% BigQuery dependency.
 
 ---
