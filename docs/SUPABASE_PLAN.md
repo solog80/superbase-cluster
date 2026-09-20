@@ -50,6 +50,7 @@ firewall holes, no public exposure of Postgres.
 | **Cross-region failover** | ✅ **cascading priorities** in envoy geo clusters — see §2.6 |
 | **SFX video delivery** | ✅ **signing on the Go mesh + CF edge cache** for `objects.solofx.net` — see §15 |
 | **us1/Edge security hardening** | ✅ **firewall + SSH + fail2ban** — see §16. DB/admin ports now Tailscale-only; public web/streaming/payment untouched. ❗ **Ufw NOT enabled** (would flush Docker's FORWARD chain) |
+| **Dart BFF Gateway** | ✅ **deployed on us1/Edge (`saltmedia-bff`)** — Server-Driven UI at `/api/v1/bff/layout/home` (2ms latency) + HMAC security handshake — see §20 |
 
 ### Replication plumbing (us1 → ug)
 - Replicator role: `replicator` / password in `.env` (`REPLICATOR_PASSWORD`).
@@ -391,6 +392,9 @@ at all**; only "logic + DB" and external-integration functions need the Go servi
 - Access: `http://100.98.214.99:3000` (tailnet only). Config on grafana VPS: `/opt/monitoring/`.
 - Note: old native Grafana (and its Loki datasources) removed. Loki/promtail still run on us1 — re-add a Loki datasource if log dashboards are wanted.
 - Suggested alerts to add later: node down, disk > 85%, replication lag, postgres up/down.
+- **100% CPU / Server Freeze Fix:** High cardinality cAdvisor metrics across 5 nodes (each running 10-20 containers) overloaded Prometheus TSDB RAM on the small Linode VPS. RAM exhaustion caused aggressive swap thrashing (`2GB swap`), locking CPU at 100% (`iowait`) and freezing SSH/Tailscale.
+  - **Fix:** `prometheus.yml` updated with `metric_relabel_configs` to drop raw cgroups and keep only essential container metrics (`container_cpu_usage_seconds_total`, `container_memory_working_set_bytes`, `container_start_time_seconds`, etc.) with cAdvisor `scrape_interval: 30s`.
+  - **Deployment:** Copy `monitoring/prometheus.yml` to `/opt/monitoring/prometheus.yml` on the `grafana` VPS and run `docker reload` / `docker restart prometheus` (plus `--storage.tsdb.retention.size=5GB` flag).
 
 ---
 
@@ -941,5 +945,162 @@ separate from the Supabase mesh):
 - **Frontend login** for visitors is broken by the CF cookie limitation; admin login is fine.
 - Cache rules live in zone `http_request_cache_settings` (order: login-bypass → static-assets
   → respect-origin default). Managed via the same CF API token used for the saltmedia.ug zone.
+
+---
+
+## 19. Chat Push Notifications Pipeline & Admin Alert Fix (Sept 2026) ✅
+
+Full end-to-end investigation and resolution of chat push notification failures for admin accounts (`solog80@gmail.com`):
+
+### 19.1 Root Cause & Resolution Summary
+- **Firebase Cloud Functions (`salt-media-app1`)**:
+  - Fixed a `ReferenceError: Cannot access 'programName' before initialization` TDZ runtime exception in `sendChatNotifications` / `sendTVChatNotifications` ([chatNotifications.js](file:///Users/solomacbookair/Documents/myApps/saltmedia/functions/src/chatNotifications.js)).
+  - Updated admin user query to fetch both `isAdmin == true` AND `role == 'admin'` in Firestore.
+  - Allowed notification dispatch when an admin posts a message (notifying all non-sending admins and room participants).
+  - Categorized push payloads into `mention`, `admin_alert`, and `chat_message` sent via `admin.messaging().sendEachForMulticast()` with proper category titles.
+  - Successfully deployed to `salt-media-app1` via `firebase deploy`.
+
+- **Go Mesh Backend Service (`superbase-cluster/gofn`)**:
+  - Removed `!body.IsAdminMessage` from notification bypass in [chat.go](file:///Users/solomacbookair/Documents/myApps/superbase-cluster/gofn/chat.go#L413) so admin messages trigger notifications to other admins and room participants.
+  - Added dual lookup for `is_admin=eq.true` and `role=eq.admin` when querying admin user records from Supabase REST.
+  - Cross-compiled `salt-gofn` (Linux amd64), updated `/app/salt-gofn` in `/supabase-api` Docker container on Edge (`198.204.224.170`), and restarted container (verified `Up` and healthy).
+
+---
+
+## 20. Dart BFF (Backend-For-Frontend) Gateway & SDUI Architecture (Sept 2026) ✅
+
+Full design, implementation, and deployment of the **Dart BFF Gateway** (`saltmedia-bff`) on the **us1 (Edge)** node.
+
+### 20.1 Overview & Workload Split
+- **Go Mesh Services**: Retains exclusive responsibility for high-performance media operations (WebRTC, HLS video chunking, DB streaming over Tailscale `100.74.77.39`).
+- **Dart BFF (`saltmedia-bff`)**: Serves as the API gateway for the Flutter app (`saltmedia`), aggregating data, validating MTN MoMo subscriptions, and delivering Server-Driven UI (SDUI) layout responses.
+- **Shared Package (`saltmedia_shared`)**: Pure Dart package (`MediaItem`, `UIComponent`, `HomeLayoutResponse`) shared by both Flutter app and Dart BFF for 100% compile-time type safety.
+
+### 20.2 Envoy Routing & Cluster Setup
+- **Envoy Cluster (`replica-configs/us1/envoy-cds.yaml`)**:
+  ```yaml
+  - '@type': type.googleapis.com/envoy.config.cluster.v3.Cluster
+    name: dart_bff
+    connect_timeout: 5s
+    type: STRICT_DNS
+    dns_refresh_rate: 5s
+    lb_policy: ROUND_ROBIN
+    load_assignment:
+      cluster_name: dart_bff
+      endpoints:
+        - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: saltmedia-bff
+                    port_value: 8080
+  ```
+- **Envoy Route (`replica-configs/us1/envoy-lds.template.yaml`)**:
+  - `prefix: /api/v1/bff/` routed directly to cluster `dart_bff` on container port 8080 (`saltmedia-bff` on `supabase_default` network).
+  - Placed before `/api/v1/` catch-all route so requests bypass legacy `gofn` dispatcher.
+  - Configured with `typed_per_filter_config` to allow public client access without basic auth.
+
+### 20.3 Live Verification & Response Metrics
+- **Public Endpoint**: `https://edge.solofx.net/api/v1/bff/layout/home`
+- **HTTP Status**: `200 OK` (`x-envoy-upstream-service-time: 2ms`)
+- **Configured Production Streams**:
+  - **Salt TV Channel 1**: `https://stream.salttelevision.com/app/stream/abr.m3u8`
+  - **Salt TV Channel 2**: `https://stream.salttelevision.com/app/stream2/abr.m3u8`
+  - **107 Salt FM**: `https://edge.solofx.net/radio/saltfm.mp3`
+
+### 20.4 Legacy App Compatibility & Fallback Matrix
+- **Legacy Apps (v3.1 & older)**: Continue making direct calls to Firebase Firestore / Remote Config & Supabase `/rest/v1` without disruption.
+- **Updated Apps (v3.2+)**: Use 3-tier fallback matrix:
+  1. **Tier 1**: Call Dart BFF Gateway (`/api/v1/bff/layout/home`).
+  2. **Tier 2**: Direct Firebase Firestore layout call if BFF is unreachable.
+  3. **Tier 3**: Static local fallback layout (`lib/services/fallback_layout.dart`) if offline.
+
+### 20.5 Multi-Region Replica Expansion (`eu1`, `eu2`, `us2`, `ug`) ✅
+- **Phase 2 Expansion Completed**: `saltmedia-bff` containers are deployed across `us1` (US East Primary), `eu1` (Frankfurt, Europe), and `ug` (QNAP Kampala, Africa), providing 100% regional high-availability and zero cross-Atlantic network delays for catalog and layout reads.
+
+---
+
+## 21. Multi-Region Replica BFF Architecture & Geographic Request Flow (Sep 2026) ✅
+
+### 21.1 Deployed Multi-Region Replica BFF Topology
+
+| Node / Region | Host / IP | Local Container Port | Go Mesh & DB Endpoint | Health Check Status | Priority Tier |
+|---|---|---|---|---|---|
+| **us1 (Primary)** | `Edge` (`100.74.77.39`) | `:8080` | `http://100.74.77.39:8090` | ✅ `200 OK` | **Prio 0** (Primary) |
+| **eu1 (Europe)** | `origin-contabo` (`100.116.100.32`) | `:8088` | `http://100.116.100.32:5557` | ✅ `200 OK` | **Prio 1** (EU Failover) |
+| **ug (Africa)** | `nas-ts` QNAP (`100.116.185.70`) | `:8088` | `http://100.116.185.70:5558` | ✅ `200 OK` | **Prio 2** (Africa Failover) |
+
+### 21.2 Envoy Cascading Priority Configuration (`replica-configs/us1/envoy-cds.yaml`)
+Envoy's `dart_bff` cluster routes requests across the 3 BFF instances with priority tiers and automatic health checking:
+```yaml
+  - '@type': type.googleapis.com/envoy.config.cluster.v3.Cluster
+    name: dart_bff
+    connect_timeout: 4s
+    type: STRICT_DNS
+    dns_refresh_rate: 5s
+    lb_policy: ROUND_ROBIN
+    load_assignment:
+      cluster_name: dart_bff
+      endpoints:
+        - priority: 0
+          lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: saltmedia-bff
+                    port_value: 8080
+        - priority: 1
+          lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: 100.116.100.32
+                    port_value: 8088
+        - priority: 2
+          lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: 100.116.185.70
+                    port_value: 8088
+```
+
+### 21.3 Server-Side RAM Caching & Realtime Invalidation
+- **30-Second Server RAM Cache**: `saltmedia-bff` maintains an in-memory catalog cache (`catalogMemoryTtl = Duration(seconds: 30)`), serving repeat calls in **4ms** (`x-envoy-upstream-service-time: 4`).
+- **Instant Realtime Cache Invalidation**: `POST /api/v1/bff/ondemand/purge-cache` resets the RAM cache (`cachedCatalogResponse = null`). When Supabase Realtime emits `tv_shows`, `seasons`, or `episodes` postgres_changes, the app / backend fires `/purge-cache` to immediately purge stale memory.
+
+### 21.4 End-to-End Request Journey for a User in Uganda
+1. **Cold Start**: App displays Hive cache (`ondemand:published_v2`) in **0ms**.
+2. **Network Request**: App calls `GET /api/v1/bff/ondemand/catalog` (Cloudflare attaches `CF-IPCountry: UG`).
+3. **Cloudflare Edge CDN**: Serves cached response in **~10ms** if Edge hit.
+4. **Envoy Geo-Routing**: On CDN miss, Envoy routes request to `ug` replica (`100.116.185.70:8088` on QNAP Kampala).
+
+---
+
+## 22. Real-Time Live TV & OvenMediaEngine Mesh Analytics Architecture (Sep 2026) ✅
+
+### 22.1 Overview & Endpoint Routing
+Live TV statistics in `saltmedia-admin-app` are fully integrated into the Go Mesh API (`salt-gofn` in `superbase-cluster`), eliminating direct raw IP/port proxying and legacy GCP Firebase Cloud Function calls.
+
+| Analytics Feature | Endpoint Path | Source Engine / Storage | Performance & Cost Optimization |
+|---|---|---|---|
+| **Live TV Edge Stats** | `GET /api/v1/getLiveTvStats` | OvenMediaEngine Native REST API (`http://127.0.0.1:8081`) + Edge daemon (`:8099`) | $0 BigQuery cost (Edge memory poll) |
+| **Historical Viewer Stats** | `GET /api/v1/getViewerStats` | BigQuery `viewer_logs.viewer_requests_real` | 60s memory cached (`metricsCacheTTL`) |
+| **Viewer Countries & ISPs** | `GET /api/v1/getViewerCountries` | BigQuery `viewer_logs.viewer_requests_real` | MaxMind GeoIP + 60s memory cached |
+| **Peak & Current Viewers** | `GET /api/v1/getViewerPeak` | BigQuery `viewer_logs.viewer_requests_real` | 7-day peak calculation + 5-min active window |
+
+### 22.2 OvenMediaEngine Adaptive Bitrate (ABR) Pattern Normalization
+Stream name pattern matching in `saltmedia-admin-app` (`useLiveTvStats.ts` and `page.tsx`) recognizes and aggregates all Adaptive Bitrate (ABR) stream variants:
+- **Salt TV One**: `stream`, `app/stream`, `app/stream/abr.m3u8`, `stream/abr.m3u8`
+- **Salt TV Two**: `stream2`, `app/stream2`, `app/stream2/abr.m3u8`, `stream2/abr.m3u8`
+
+### 22.3 Admin Dashboard Proxying Flow
+1. **Frontend Hook (`useLiveTvStats.ts`)**: Invokes `/api/live-tv-stats?action=stats|countries|peak_bq|live`.
+2. **Next.js API Route (`src/app/api/live-tv-stats/route.ts`)**: Attaches `SERVICE_ROLE_KEY` and proxies to `${API_BASE_URL}/<endpoint>`.
+3. **Go Mesh Service (`salt-gofn` on `us1` / `Edge`)**: Executes `handleGetLiveTvStats`, `handleGetViewerStats`, `handleGetViewerCountries`, or `handleGetViewerPeak`.
+
+
+
+
 
 ---

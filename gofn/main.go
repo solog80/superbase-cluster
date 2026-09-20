@@ -271,6 +271,14 @@ func (s *server) dispatch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.handleGetAdminAnalytics(w, r)
+	case "getLiveTvStats":
+		s.handleGetLiveTvStats(w, r)
+	case "getViewerStats":
+		s.handleGetViewerStats(w, r)
+	case "getViewerCountries":
+		s.handleGetViewerCountries(w, r)
+	case "getViewerPeak":
+		s.handleGetViewerPeak(w, r)
 	case "sendNotification", "getSentNotifications", "getLinkMetadata", "deleteNotification", "clearSentNotifications", "deleteNotifications":
 		if !s.isServiceKey(r) {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"success": false, "error": "Unauthorized: Admin access required"})
@@ -407,6 +415,10 @@ func (s *server) publicFn(name string) bool {
 		"batchTrackContentSessions",
 		"getAnalyticsMetrics",
 		"getFirebaseAnalytics",
+		"getLiveTvStats",
+		"getViewerStats",
+		"getViewerCountries",
+		"getViewerPeak",
 		"getRadioHistory",
 		"getRadioReports",
 		"getRadioCountryDetails",

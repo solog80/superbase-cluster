@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 )
 
 const bqScope = "https://www.googleapis.com/auth/bigquery"
@@ -37,7 +38,8 @@ func (s *server) bigQueryQuery(ctx context.Context, query string) ([]map[string]
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := s.client.Do(req)
+	bqClient := &http.Client{Timeout: 35 * time.Second}
+	resp, err := bqClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
