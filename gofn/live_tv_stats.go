@@ -30,16 +30,20 @@ type OMENativeResponse struct {
 		MaxTotalConnections int                  `json:"maxTotalConnections"`
 		AvgThroughputIn     int64                `json:"avgThroughputIn"`
 		AvgThroughputOut    int64                `json:"avgThroughputOut"`
+		LastThroughputIn    int64                `json:"lastThroughputIn"`
+		LastThroughputOut   int64                `json:"lastThroughputOut"`
+		TotalBytesIn        int64                `json:"totalBytesIn"`
+		TotalBytesOut       int64                `json:"totalBytesOut"`
 		Connections         OMENativeConnections `json:"connections"`
 	} `json:"response"`
 }
 
-// fetchOMENativeStats queries OvenMediaEngine's native REST API (/v1/stats/current/...) on port 8081.
+// fetchOMENativeStats queries OvenMediaEngine's native REST API (/v1/stats/current/...) on port 8091.
 func (s *server) fetchOMENativeStats(ctx context.Context, subPath string) (*OMENativeResponse, error) {
-	omeHost := getenv("OME_API_HOST", "http://127.0.0.1:8081")
-	omeToken := osGetenv("OME_ACCESS_TOKEN", "ome-access-token")
+	omeHost := getenv("OME_API_HOST", "http://127.0.0.1:8091")
+	omeToken := osGetenv("OME_ACCESS_TOKEN", "s4lt5tv_0me_api_2026")
 	if omeToken == "" {
-		omeToken = osGetenv("OME_API_TOKEN", "")
+		omeToken = osGetenv("OME_API_TOKEN", "s4lt5tv_0me_api_2026")
 	}
 
 	targetURL := fmt.Sprintf("%s/v1/stats/current/vhosts/default/apps/app%s", omeHost, subPath)
@@ -121,39 +125,44 @@ func (s *server) handleGetLiveTvStats(w http.ResponseWriter, r *http.Request) {
 		daemonMap = map[string]any{}
 	}
 
-	// 2. Try fetching OME Native REST API metrics (port 8081) for exact real-time concurrent sockets
-	omeApp, omeErr := s.fetchOMENativeStats(ctx, "")
-	if omeErr == nil && omeApp != nil && omeApp.StatusCode == 200 {
-		res := omeApp.Response
-		daemonMap["total_connections"] = res.TotalConnections
-		daemonMap["llhls_connections"] = res.Connections.LLHLS
-		daemonMap["webrtc_connections"] = res.Connections.WebRTC
-		daemonMap["avg_throughput_out"] = res.AvgThroughputOut
-		daemonMap["avg_throughput_in"] = res.AvgThroughputIn
-		if res.TotalConnections > 0 {
-			daemonMap["viewers"] = res.TotalConnections
-		}
-	} else {
-		// Default fallback values if OME 8081 is not available locally
-		daemonMap["total_connections"] = daemonMap["viewers"]
-		daemonMap["llhls_connections"] = 0
-		daemonMap["webrtc_connections"] = 0
-		daemonMap["avg_throughput_out"] = 0
-		daemonMap["avg_throughput_in"] = 0
+	// 2. Try fetching per-stream native OME stats (port 8091) for exact real-time concurrent sockets
+	stMap := map[string]any{}
+	totalConn := 0
+	totalLLHLS := 0
+	totalWebRTC := 0
+	var sumThroughputOut int64 = 0
+	var sumThroughputIn int64 = 0
+
+	if stream1, err := s.fetchOMENativeStats(ctx, "/streams/stream"); err == nil && stream1 != nil && stream1.StatusCode == 200 {
+		res := stream1.Response
+		stMap["app/stream/abr.m3u8"] = res.TotalConnections
+		stMap["stream"] = res.TotalConnections
+		totalConn += res.TotalConnections
+		totalLLHLS += res.Connections.LLHLS
+		totalWebRTC += res.Connections.WebRTC
+		sumThroughputOut += res.LastThroughputOut
+		sumThroughputIn += res.LastThroughputIn
 	}
 
-	// 3. Try fetching per-stream native OME stats if available
-	if stream1, err := s.fetchOMENativeStats(ctx, "/streams/stream"); err == nil && stream1 != nil {
-		if stMap, ok := daemonMap["streams"].(map[string]any); ok {
-			stMap["app/stream/abr.m3u8"] = stream1.Response.TotalConnections
-		} else {
-			daemonMap["streams"] = map[string]any{"app/stream/abr.m3u8": stream1.Response.TotalConnections}
-		}
+	if stream2, err := s.fetchOMENativeStats(ctx, "/streams/stream2"); err == nil && stream2 != nil && stream2.StatusCode == 200 {
+		res := stream2.Response
+		stMap["app/stream2/abr.m3u8"] = res.TotalConnections
+		stMap["stream2"] = res.TotalConnections
+		totalConn += res.TotalConnections
+		totalLLHLS += res.Connections.LLHLS
+		totalWebRTC += res.Connections.WebRTC
+		sumThroughputOut += res.LastThroughputOut
+		sumThroughputIn += res.LastThroughputIn
 	}
-	if stream2, err := s.fetchOMENativeStats(ctx, "/streams/stream2"); err == nil && stream2 != nil {
-		if stMap, ok := daemonMap["streams"].(map[string]any); ok {
-			stMap["app/stream2/abr.m3u8"] = stream2.Response.TotalConnections
-		}
+
+	daemonMap["streams"] = stMap
+	daemonMap["total_connections"] = totalConn
+	daemonMap["llhls_connections"] = totalLLHLS
+	daemonMap["webrtc_connections"] = totalWebRTC
+	daemonMap["avg_throughput_out"] = sumThroughputOut
+	daemonMap["avg_throughput_in"] = sumThroughputIn
+	if totalConn > 0 {
+		daemonMap["viewers"] = totalConn
 	}
 
 	writeJSON(w, http.StatusOK, daemonMap)
