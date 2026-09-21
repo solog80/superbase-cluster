@@ -287,9 +287,6 @@ func (s *server) handleGetViewerPeak(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
-	defer cancel()
-
 	var windowVal any = nil
 	if hasWindow {
 		windowVal = minutes
@@ -299,20 +296,9 @@ func (s *server) handleGetViewerPeak(w http.ResponseWriter, r *http.Request) {
 	vStats := globalVarnishTracker.GetStats(30 * time.Second)
 	currentVal := vStats.TotalViewers
 
-	peakVal := 2793 // Lifetime historical peak
-	if s.tsdb != nil {
-		if db, err := s.tsdbDB(ctx); err == nil {
-			var tsdbPeak int
-			_ = db.QueryRowContext(ctx, "SELECT coalesce(max(distinct_sessions), 0) FROM public.viewer_daily").Scan(&tsdbPeak)
-			if tsdbPeak > peakVal {
-				peakVal = tsdbPeak
-			}
-		}
-	}
-
 	writeJSON(w, http.StatusOK, map[string]any{
-		"peak_viewers":    peakVal,
-		"peak_time":       "2026-09-21T06:15:38Z",
+		"peak_viewers":    currentVal,
+		"peak_time":       time.Now().UTC().Format(time.RFC3339),
 		"window_minutes":  windowVal,
 		"current_viewers": currentVal,
 		"source":          "varnish_30s_window",
