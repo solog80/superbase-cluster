@@ -42,10 +42,10 @@ type OMENativeResponse struct {
 func (s *server) fetchOMENativeStats(ctx context.Context, subPath string) (*OMENativeResponse, error) {
 	hosts := []string{
 		getenv("OME_API_HOST", ""),
-		"http://127.0.0.1:8091",
 		"http://172.27.0.1:8091",
 		"http://host.docker.internal:8091",
 		"http://198.204.224.170:8091",
+		"http://127.0.0.1:8091",
 	}
 	omeToken := osGetenv("OME_ACCESS_TOKEN", "s4lt5tv_0me_api_2026")
 	if omeToken == "" {
@@ -57,9 +57,11 @@ func (s *server) fetchOMENativeStats(ctx context.Context, subPath string) (*OMEN
 		if omeHost == "" {
 			continue
 		}
+		attemptCtx, attemptCancel := context.WithTimeout(ctx, 1500*time.Millisecond)
 		targetURL := fmt.Sprintf("%s/v1/stats/current/vhosts/default/apps/app%s", omeHost, subPath)
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
+		req, err := http.NewRequestWithContext(attemptCtx, http.MethodGet, targetURL, nil)
 		if err != nil {
+			attemptCancel()
 			lastErr = err
 			continue
 		}
@@ -71,18 +73,21 @@ func (s *server) fetchOMENativeStats(ctx context.Context, subPath string) (*OMEN
 
 		resp, err := s.client.Do(req)
 		if err != nil {
+			attemptCancel()
 			lastErr = err
 			continue
 		}
 
 		if resp.StatusCode >= 300 {
 			_ = resp.Body.Close()
+			attemptCancel()
 			lastErr = fmt.Errorf("ome api status %d", resp.StatusCode)
 			continue
 		}
 
 		body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		_ = resp.Body.Close()
+		attemptCancel()
 		if err != nil {
 			lastErr = err
 			continue
