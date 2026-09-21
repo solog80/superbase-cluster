@@ -18,13 +18,120 @@ type VarnishViewerSession struct {
 	LastSeen  time.Time
 }
 
+type MinuteSnapshot struct {
+	Minute        time.Time
+	Stream1Viewers int
+	Stream2Viewers int
+}
+
 type VarnishWindowTracker struct {
-	mu       sync.RWMutex
-	sessions map[string]*VarnishViewerSession // key = stream + ":" + ClientIP + ":" + SessionID
+	mu           sync.RWMutex
+	sessions     map[string]*VarnishViewerSession // key = stream + ":" + ClientIP + ":" + SessionID
+	history      []MinuteSnapshot
+	lastSnapshot time.Time
 }
 
 var globalVarnishTracker = &VarnishWindowTracker{
 	sessions: make(map[string]*VarnishViewerSession),
+}
+
+func (vt *VarnishWindowTracker) RecordMinuteSnapshot() {
+	vt.mu.Lock()
+	defer vt.mu.Unlock()
+
+	now := time.Now().UTC().Truncate(time.Minute)
+	if !vt.lastSnapshot.IsZero() && now.Equal(vt.lastSnapshot) {
+		return // Already recorded for this minute
+	}
+
+	cutoff := time.Now().Add(-30 * time.Second)
+	s1 := 0
+	s2 := 0
+	for _, sess := range vt.sessions {
+		if sess.LastSeen.After(cutoff) {
+			if sess.Stream == "stream" {
+				s1++
+			} else if sess.Stream == "stream2" {
+				s2++
+			}
+		}
+	}
+
+	vt.history = append(vt.history, MinuteSnapshot{
+		Minute:         now,
+		Stream1Viewers: s1,
+		Stream2Viewers: s2,
+	})
+
+	// Retain up to 1440 minutes (24 hours) of history
+	if len(vt.history) > 1440 {
+		vt.history = vt.history[len(vt.history)-1440:]
+	}
+	vt.lastSnapshot = now
+}
+
+func (vt *VarnishWindowTracker) GetHistory(requestedMinutes int) []map[string]any {
+	vt.mu.RLock()
+	defer vt.mu.RUnlock()
+
+	if requestedMinutes < 1 {
+		requestedMinutes = 30
+	}
+	if requestedMinutes > 1440 {
+		requestedMinutes = 1440
+	}
+
+	cutoff := time.Now().UTC().Add(-time.Duration(requestedMinutes) * time.Minute)
+	var result []map[string]any
+
+	for _, snap := range vt.history {
+		if snap.Minute.After(cutoff) || snap.Minute.Equal(cutoff) {
+			minuteIso := snap.Minute.Format(time.RFC3339)
+			result = append(result, map[string]any{
+				"minute":  minuteIso,
+				"stream":  "stream",
+				"viewers": snap.Stream1Viewers,
+			})
+			result = append(result, map[string]any{
+				"minute":  minuteIso,
+				"stream":  "stream2",
+				"viewers": snap.Stream2Viewers,
+			})
+		}
+	}
+
+	// If history has fewer than 2 snapshots (e.g. initial startup), pre-fill recent minutes with current counts
+	if len(result) == 0 {
+		now := time.Now().UTC().Truncate(time.Minute)
+		s1 := 0
+		s2 := 0
+		cutoffSess := time.Now().Add(-30 * time.Second)
+		for _, sess := range vt.sessions {
+			if sess.LastSeen.After(cutoffSess) {
+				if sess.Stream == "stream" {
+					s1++
+				} else if sess.Stream == "stream2" {
+					s2++
+				}
+			}
+		}
+		for i := requestedMinutes - 1; i >= 0; i-- {
+			t := now.Add(-time.Duration(i) * time.Minute)
+			mIso := t.Format(time.RFC3339)
+			result = append(result, map[string]any{
+				"minute":  mIso,
+				"stream":  "stream",
+				"viewers": s1,
+			})
+			result = append(result, map[string]any{
+				"minute":  mIso,
+				"stream":  "stream2",
+				"viewers": s2,
+			})
+		}
+	}
+
+	return result
 }
 
 // RecordHit processes a single log line (or IP + raw URI tuple).
@@ -98,6 +205,27 @@ func (vt *VarnishWindowTracker) StartCleanupLoop(interval, windowDuration time.D
 	for range ticker.C {
 		vt.CleanupExpired(windowDuration)
 	}
+}
+
+func (vt *VarnishWindowTracker) GetActiveViewerIPs(windowDuration time.Duration) []string {
+	vt.mu.RLock()
+	defer vt.mu.RUnlock()
+
+	cutoff := time.Now().Add(-windowDuration)
+	ipMap := make(map[string]bool)
+	for _, sess := range vt.sessions {
+		if sess.LastSeen.After(cutoff) {
+			if sess.ClientIP != "" && sess.ClientIP != "-" {
+				ipMap[sess.ClientIP] = true
+			}
+		}
+	}
+
+	ips := make([]string, 0, len(ipMap))
+	for ip := range ipMap {
+		ips = append(ips, ip)
+	}
+	return ips
 }
 
 type LiveStatsSummary struct {

@@ -156,6 +156,18 @@ func (s *server) buildEPGPayload(stations []epgStation, programs []epgProgram, d
 	}
 }
 
+func makeTvProgramID(p epgProgram) string {
+	if p.TvProgramID != nil && strings.TrimSpace(*p.TvProgramID) != "" {
+		return strings.TrimSpace(*p.TvProgramID)
+	}
+	s := strings.ToLower(p.StationID)
+	s = strings.ReplaceAll(s, " ", "_")
+	prog := strings.ToLower(p.ProgramName)
+	prog = strings.ReplaceAll(prog, " ", "_")
+	tStr := strings.ReplaceAll(p.StartTime, ":", "")
+	return fmt.Sprintf("%s_%s_%s", s, prog, tStr)
+}
+
 // filterPrograms returns programs for a station that air today (same day or
 // crossing midnight from yesterday), shaped exactly like the app expects.
 func filterPrograms(programs []epgProgram, stationID, dayName, yesterdayDay string) []map[string]any {
@@ -168,6 +180,7 @@ func filterPrograms(programs []epgProgram, stationID, dayName, yesterdayDay stri
 			continue
 		}
 		out = append(out, map[string]any{
+			"tvProgramId": makeTvProgramID(p),
 			"programName": p.ProgramName,
 			"presenter":   orNilStr(p.Presenter),
 			"genre":       orNilStr(p.Genre),
@@ -179,6 +192,7 @@ func filterPrograms(programs []epgProgram, stationID, dayName, yesterdayDay stri
 			"type":        orNilStr(p.Type),
 			"image":       orNilStr(p.Image),
 			"thumbnail":   orNilStr(p.Thumbnail),
+			"enableChat":  true,
 		})
 	}
 	return out

@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -164,114 +165,102 @@ func (s *server) handleGetViewerStats(w http.ResponseWriter, r *http.Request) {
 		minutes = 1440
 	}
 
-	vStats := globalVarnishTracker.GetStats(30 * time.Second)
-	now := time.Now().UTC().Truncate(time.Minute)
-
-	normalized := []map[string]any{
-		{
-			"minute":  now.Format(time.RFC3339),
-			"stream":  "stream",
-			"viewers": vStats.StreamCounts["stream"],
-		},
-		{
-			"minute":  now.Format(time.RFC3339),
-			"stream":  "stream2",
-			"viewers": vStats.StreamCounts["stream2"],
-		},
-	}
+	globalVarnishTracker.RecordMinuteSnapshot()
+	history := globalVarnishTracker.GetHistory(minutes)
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"viewers": normalized,
+		"viewers": history,
 		"minutes": minutes,
 	})
 }
 
-// Country code lookup map for ISO 2-letter codes.
-var countryToISO = map[string]string{
-	"Uganda":               "UG",
-	"Saudi Arabia":         "SA",
-	"United Arab Emirates": "AE",
-	"United States":        "US",
-	"United Kingdom":       "GB",
-	"Belgium":              "BE",
-	"Kenya":                "KE",
-	"Tanzania":             "TZ",
-	"Rwanda":               "RW",
-	"South Africa":         "ZA",
-	"Canada":               "CA",
-	"Germany":              "DE",
-	"Sweden":               "SE",
-	"Qatar":                "QA",
-	"Oman":                 "OM",
-	"Bahrain":              "BH",
-	"Kuwait":               "KW",
-}
-
-// handleGetViewerCountries queries viewer country and ISP breakdowns with ISO 2-letter country codes.
+// handleGetViewerCountries queries viewer country and ISP breakdowns dynamically from active Varnish sessions.
 func (s *server) handleGetViewerCountries(w http.ResponseWriter, r *http.Request) {
-	minutes := atoiDefault(r.URL.Query().Get("minutes"), 30)
+	minutes := atoiDefault(r.URL.Query().Get("minutes"), 60)
 	if minutes < 1 {
 		minutes = 1
 	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
-
-	// 1. Query TSDB viewer_daily with date filter & ISO mapping
-	if s.tsdb != nil {
-		if db, err := s.tsdbDB(ctx); err == nil {
-			rows, err := db.QueryContext(ctx, `
-				SELECT country, sum(distinct_sessions) as viewers
-				FROM public.viewer_daily
-				WHERE country IS NOT NULL AND country != 'Unknown' AND country != ''
-				GROUP BY country
-				ORDER BY viewers DESC
-				LIMIT 15`)
-			if err == nil {
-				defer rows.Close()
-				var countries []map[string]any
-				for rows.Next() {
-					var country string
-					var viewers int
-					if err := rows.Scan(&country, &viewers); err == nil {
-						code := countryToISO[country]
-						if code == "" && len(country) == 2 {
-							code = strings.ToUpper(country)
-						} else if code == "" {
-							code = "UG"
-						}
-						countries = append(countries, map[string]any{
-							"country": country,
-							"code":    code,
-							"viewers": viewers,
-						})
-					}
-				}
-				if len(countries) > 0 {
-					writeJSON(w, http.StatusOK, map[string]any{
-						"countries": countries,
-						"isps":      []map[string]any{},
-						"minutes":   minutes,
-					})
-					return
-				}
-			}
-		}
+	if minutes > 1440 {
+		minutes = 1440
 	}
 
-	// 2. Default fallback response (fast < 1ms) with ISO 2-letter codes
+	activeIPs := globalVarnishTracker.GetActiveViewerIPs(time.Duration(minutes) * time.Minute)
+
+	countryCounts := make(map[string]int)
+	countryCodeMap := make(map[string]string)
+	countryNameMap := make(map[string]string)
+
+	ispCounts := make(map[string]int)
+	ispCodeMap := make(map[string]string)
+	ispNameMap := make(map[string]string)
+
+	for _, ip := range activeIPs {
+		geo := globalGeoIPService.Lookup(ip)
+
+		cKey := fmt.Sprintf("%s:%s", geo.CountryCode, geo.CountryName)
+		countryCounts[cKey]++
+		countryCodeMap[cKey] = geo.CountryCode
+		countryNameMap[cKey] = geo.CountryName
+
+		iKey := fmt.Sprintf("%s:%s", geo.CountryCode, geo.ISP)
+		ispCounts[iKey]++
+		ispCodeMap[iKey] = geo.CountryCode
+		ispNameMap[iKey] = geo.ISP
+	}
+
+	type countryItem struct {
+		Code    string `json:"code"`
+		Country string `json:"country"`
+		Viewers int    `json:"viewers"`
+	}
+	var countries []countryItem
+	for k, count := range countryCounts {
+		countries = append(countries, countryItem{
+			Code:    countryCodeMap[k],
+			Country: countryNameMap[k],
+			Viewers: count,
+		})
+	}
+	sort.Slice(countries, func(i, j int) bool {
+		return countries[i].Viewers > countries[j].Viewers
+	})
+
+	type ispItem struct {
+		Code    string `json:"code"`
+		ISP     string `json:"isp"`
+		Viewers int    `json:"viewers"`
+	}
+	var isps []ispItem
+	for k, count := range ispCounts {
+		isps = append(isps, ispItem{
+			Code:    ispCodeMap[k],
+			ISP:     ispNameMap[k],
+			Viewers: count,
+		})
+	}
+	sort.Slice(isps, func(i, j int) bool {
+		return isps[i].Viewers > isps[j].Viewers
+	})
+
+	if len(countries) > 20 {
+		countries = countries[:20]
+	}
+	if len(isps) > 20 {
+		isps = isps[:20]
+	}
+
+	if countries == nil {
+		countries = []countryItem{}
+	}
+	if isps == nil {
+		isps = []ispItem{}
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
-		"countries": []map[string]any{
-			{"country": "Uganda", "code": "UG", "viewers": 7},
-			{"country": "Saudi Arabia", "code": "SA", "viewers": 2},
-			{"country": "United Arab Emirates", "code": "AE", "viewers": 1},
-			{"country": "United States", "code": "US", "viewers": 1},
-		},
-		"isps": []map[string]any{
-			{"code": "UG", "isp": "MTN Uganda", "viewers": 4},
-			{"code": "UG", "isp": "Airtel Uganda", "viewers": 3},
-		},
-		"minutes": minutes,
+		"countries": countries,
+		"isps":      isps,
+		"minutes":   minutes,
+		"source":    "varnish_geoip_realtime",
 	})
 }
 

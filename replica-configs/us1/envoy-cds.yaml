@@ -422,3 +422,38 @@ resources:
           max_connections: 10000
           max_pending_requests: 10000
           max_requests: 10000
+
+  - '@type': type.googleapis.com/envoy.config.cluster.v3.Cluster
+    name: dart_bff
+    connect_timeout: 4s
+    type: STRICT_DNS
+    dns_refresh_rate: 5s
+    dns_failure_refresh_rate:
+      base_interval: 1s
+      max_interval: 1s
+    lb_policy: ROUND_ROBIN
+    load_assignment:
+      cluster_name: dart_bff
+      endpoints:
+        - priority: 0
+          lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: saltmedia-bff
+                    port_value: 8080
+        - priority: 1
+          lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: 100.116.100.32
+                    port_value: 8088
+        - priority: 2
+          lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: 100.116.185.70
+                    port_value: 8088
+

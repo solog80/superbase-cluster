@@ -72,6 +72,7 @@ scrape_configs:
         replacement: us2
 
   - job_name: cadvisor
+    scrape_interval: 30s
     static_configs:
       - targets:
           - 100.74.77.39:9098
@@ -100,3 +101,12 @@ scrape_configs:
         regex: "100.82.159.75:.*"
         target_label: instance
         replacement: us2
+    metric_relabel_configs:
+      # Drop metrics for raw cgroups without a container name
+      - source_labels: [name, container_label_com_docker_compose_service]
+        regex: "^;$"
+        action: drop
+      # Keep only essential container metrics needed for alerts & dashboards
+      - source_labels: [__name__]
+        regex: "(container_cpu_usage_seconds_total|container_memory_working_set_bytes|container_start_time_seconds|container_network_receive_bytes_total|container_network_transmit_bytes_total|container_fs_usage_bytes|container_spec_memory_limit_bytes)"
+        action: keep

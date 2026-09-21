@@ -106,7 +106,7 @@ func main() {
 	s.startChatScheduler()
 	s.startNotificationStaleCleanup()
 
-	go globalVarnishTracker.StartCleanupLoop(5*time.Second, 30*time.Second)
+	go globalVarnishTracker.StartCleanupLoop(15*time.Second, 120*time.Minute)
 	go startVarnishUDPListener(getenv("VARNISH_LOG_PORT", "8092"))
 
 	port := getenv("PORT", "8080")

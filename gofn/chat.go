@@ -409,8 +409,8 @@ func (s *server) handleProcessChatMessage(w http.ResponseWriter, r *http.Request
 		_ = s.upsertChatParticipant(ctx, body.RoomID, body.UserID, orStr(body.UserName, "Anonymous"), profileImg)
 	}
 
-	// 2. Notifications (skip admin/system/lottie/expression messages).
-	if !body.IsAdminMessage && !body.IsLottieEmoji && !body.IsExpression {
+	// 2. Notifications (skip lottie/expression messages).
+	if !body.IsLottieEmoji && !body.IsExpression {
 		s.sendChatNotifications(ctx, body.RoomID, body.MessageID, body.UserID, orStr(body.UserName, "Anonymous"), body.MessageContent)
 	}
 
@@ -437,12 +437,30 @@ func (s *server) upsertChatParticipant(ctx context.Context, roomID, userID, user
 	return s.restPostRow(ctx, "chat_participants", row)
 }
 
-// sendChatNotifications resolves @mentions + admins and sends FCM pushes.
+// sendChatNotifications resolves @mentions + admins + room participants and sends FCM pushes.
 func (s *server) sendChatNotifications(ctx context.Context, roomID, messageID, senderID, senderName, content string) {
 	recipients := map[string]bool{}
 	mentionedIDs := map[string]bool{}
+	participantIDs := map[string]bool{}
 
-	// @mentions → user_profiles by user_name.
+	// 1. Room participants from chat_participants.
+	if raw, _, err := s.doRest(ctx, "chat_participants", url.Values{
+		"select": {"user_id"}, "room_id": {"eq." + url.QueryEscape(roomID)},
+	}); err == nil {
+		var rows []struct {
+			UserID string `json:"user_id"`
+		}
+		if json.Unmarshal(raw, &rows) == nil {
+			for _, r := range rows {
+				if r.UserID != "" && r.UserID != senderID {
+					participantIDs[r.UserID] = true
+					recipients[r.UserID] = true
+				}
+			}
+		}
+	}
+
+	// 2. @mentions → user_profiles by user_name.
 	mentionRe := regexp.MustCompile(`@(\w+)`)
 	for _, m := range mentionRe.FindAllStringSubmatch(content, -1) {
 		if len(m) < 2 {
@@ -463,24 +481,25 @@ func (s *server) sendChatNotifications(ctx context.Context, roomID, messageID, s
 		}
 	}
 
-	// Admins.
+	// 3. Admins (check both is_admin=true and role=admin).
 	adminIDs := map[string]bool{}
-	if raw, _, err := s.doRest(ctx, "users", url.Values{
-		"select": {"id"}, "is_admin": {"eq.true"},
-	}); err == nil {
-		var rows []struct {
-			ID string `json:"id"`
-		}
-		if json.Unmarshal(raw, &rows) == nil {
-			for _, r := range rows {
-				if r.ID == senderID {
-					continue
+	fetchAdmins := func(query url.Values) {
+		if raw, _, err := s.doRest(ctx, "users", query); err == nil {
+			var rows []struct {
+				ID string `json:"id"`
+			}
+			if json.Unmarshal(raw, &rows) == nil {
+				for _, r := range rows {
+					if r.ID != "" && r.ID != senderID {
+						adminIDs[r.ID] = true
+						recipients[r.ID] = true
+					}
 				}
-				adminIDs[r.ID] = true
-				recipients[r.ID] = true
 			}
 		}
 	}
+	fetchAdmins(url.Values{"select": {"id"}, "is_admin": {"eq.true"}})
+	fetchAdmins(url.Values{"select": {"id"}, "role": {"eq.admin"}})
 
 	if len(recipients) == 0 {
 		return
@@ -497,7 +516,18 @@ func (s *server) sendChatNotifications(ctx context.Context, roomID, messageID, s
 		}
 	}
 
-	// Build per-user notification type: mention wins, else admin_alert.
+	formattedRoomName := roomName
+	words := strings.Fields(strings.ReplaceAll(roomName, "_", " "))
+	for i, w := range words {
+		if len(w) > 0 {
+			words[i] = strings.ToUpper(w[:1]) + strings.ToLower(w[1:])
+		}
+	}
+	if len(words) > 0 {
+		formattedRoomName = strings.Join(words, " ")
+	}
+
+	// Build per-user notification type: mention wins, else admin_alert, else chat_message.
 	userNotification := map[string]string{}
 	for uid := range mentionedIDs {
 		userNotification[uid] = "mention"
@@ -505,6 +535,11 @@ func (s *server) sendChatNotifications(ctx context.Context, roomID, messageID, s
 	for uid := range adminIDs {
 		if _, ok := userNotification[uid]; !ok {
 			userNotification[uid] = "admin_alert"
+		}
+	}
+	for uid := range participantIDs {
+		if _, ok := userNotification[uid]; !ok {
+			userNotification[uid] = "chat_message"
 		}
 	}
 
@@ -533,17 +568,23 @@ func (s *server) sendChatNotifications(ctx context.Context, roomID, messageID, s
 			var title, body string
 			var ntypeOut string
 			if ntype == "mention" {
-				title = fmt.Sprintf("New mention in %s", roomName)
+				title = fmt.Sprintf("KaBox! - %s", formattedRoomName)
 				body = fmt.Sprintf("%s mentioned you: \"%s\"", senderName, content)
 				ntypeOut = "mention"
-			} else {
-				title = fmt.Sprintf("New User Message in %s", roomName)
+			} else if ntype == "admin_alert" {
+				title = fmt.Sprintf("KaBox! - %s", formattedRoomName)
 				body = fmt.Sprintf("%s: \"%s\"", senderName, content)
 				ntypeOut = "admin_alert"
+			} else {
+				title = fmt.Sprintf("KaBox! - %s", formattedRoomName)
+				body = fmt.Sprintf("%s: \"%s\"", senderName, content)
+				ntypeOut = "chat_message"
 			}
 			data := map[string]string{
 				"type": ntypeOut, "programId": roomID, "messageId": messageID,
-				"senderId": senderID, "senderName": senderName, "click_action": "FLUTTER_NOTIFICATION_CLICK",
+				"senderId": senderID, "senderName": senderName,
+				"link": fmt.Sprintf("saltmedia://chat/%s", roomID),
+				"click_action": "FLUTTER_NOTIFICATION_CLICK",
 			}
 			if err := s.fcmSend(ctx, tok, title, body, "", data); err != nil {
 				log.Printf("[chat notify] fcm send to %s failed: %v", uid, err)

@@ -47,6 +47,8 @@ func (s *server) sendFCMMany(ctx context.Context, tokens []string, title, body, 
 				mu.Lock()
 				success++
 				mu.Unlock()
+			} else {
+				log.Printf("[fcmSend] error sending to token %s: %v", t, err)
 			}
 		}(tok)
 	}

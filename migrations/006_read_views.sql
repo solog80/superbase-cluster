@@ -171,6 +171,7 @@ as $$
   radio_programs as (
     select jsonb_agg(
       jsonb_build_object(
+        'tvProgramId', coalesce(nullif(f.tv_program_id, ''), regexp_replace(lower(f.station_id), '[^a-z0-9]+', '_', 'g') || '_' || regexp_replace(lower(f.program_name), '[^a-z0-9]+', '_', 'g') || '_' || replace(f.start_time, ':', '')),
         'programName', f.program_name,
         'presenter', f.presenter,
         'genre', f.genre,
@@ -181,7 +182,8 @@ as $$
         'days', coalesce(f.days, ''),
         'type', f.type,
         'image', f.image,
-        'thumbnail', f.thumbnail
+        'thumbnail', f.thumbnail,
+        'enableChat', true
       )
       order by f.start_time
     ) as programs
@@ -201,6 +203,7 @@ as $$
         (
           select jsonb_agg(
             jsonb_build_object(
+              'tvProgramId', coalesce(nullif(f.tv_program_id, ''), regexp_replace(lower(f.station_id), '[^a-z0-9]+', '_', 'g') || '_' || regexp_replace(lower(f.program_name), '[^a-z0-9]+', '_', 'g') || '_' || replace(f.start_time, ':', '')),
               'programName', f.program_name,
               'presenter', f.presenter,
               'genre', f.genre,
@@ -211,7 +214,8 @@ as $$
               'days', coalesce(f.days, ''),
               'type', f.type,
               'image', f.image,
-              'thumbnail', f.thumbnail
+              'thumbnail', f.thumbnail,
+              'enableChat', true
             )
             order by f.start_time
           )

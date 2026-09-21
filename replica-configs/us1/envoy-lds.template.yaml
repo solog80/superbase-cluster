@@ -288,6 +288,30 @@ resources:
                                     principals:
                                       - any: true
 
+                      - name: bff-v1-public
+                        match:
+                          prefix: /api/v1/bff/
+                        route:
+                          cluster: dart_bff
+                          prefix_rewrite: /api/v1/bff/
+                          timeout: 30s
+                        typed_per_filter_config:
+                          envoy.filters.http.basic_auth:
+                            '@type': >-
+                              type.googleapis.com/envoy.config.route.v3.FilterConfig
+                            disabled: true
+                          envoy.filters.http.rbac:
+                            '@type': >-
+                              type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBACPerRoute
+                            rbac:
+                              rules:
+                                policies:
+                                  public:
+                                    permissions:
+                                      - any: true
+                                    principals:
+                                      - any: true
+
                       - name: api-v1-all
                         match:
                           prefix: /api/v1/
@@ -1215,6 +1239,9 @@ resources:
                             - url_path:
                                 path:
                                   prefix: /graphql/v1
+                            - url_path:
+                                path:
+                                  prefix: /api/v1/bff/
                           principals:
                             - header:
                                 name: apikey

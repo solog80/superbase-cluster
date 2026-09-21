@@ -231,17 +231,18 @@ func (s *server) handleUpdateUserRole(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "message": "Role updated"})
 }
 
-// handleDeleteUser mirrors deleteUser.
+// handleDeleteUser mirrors deleteUser. Purges all matching UUIDs by userId and email.
 func (s *server) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		UserID string `json:"userId"`
+		Email  string `json:"email"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid body"})
 		return
 	}
-	if body.UserID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "userId is required"})
+	if body.UserID == "" && body.Email == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "userId or email is required"})
 		return
 	}
 
@@ -253,20 +254,50 @@ func (s *server) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := s.firebaseAuthRPC(ctx, token, projectID, "/accounts:delete", map[string]any{
-		"localId": body.UserID,
-	}); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-		return
+	uids := map[string]bool{}
+	if body.UserID != "" {
+		uids[body.UserID] = true
 	}
 
-	_ = s.restDelete(ctx, "users", "id=eq."+url.QueryEscape(body.UserID))
-	if err := s.firestoreDeleteUser(ctx, token, projectID, body.UserID); err != nil {
-		log.Printf("[deleteUser] firestore mirror failed: %v", err)
+	targetEmail := body.Email
+	if targetEmail == "" && body.UserID != "" {
+		raw, _, err := s.doRest(ctx, "users", url.Values{"select": {"email"}, "id": {"eq." + url.QueryEscape(body.UserID)}})
+		if err == nil {
+			var rows []struct {
+				Email *string `json:"email"`
+			}
+			if json.Unmarshal(raw, &rows) == nil && len(rows) == 1 && rows[0].Email != nil {
+				targetEmail = *rows[0].Email
+			}
+		}
+	}
+
+	if targetEmail != "" {
+		raw, _, err := s.doRest(ctx, "users", url.Values{"select": {"id"}, "email": {"eq." + url.QueryEscape(targetEmail)}})
+		if err == nil {
+			var rows []struct {
+				ID string `json:"id"`
+			}
+			if json.Unmarshal(raw, &rows) == nil {
+				for _, r := range rows {
+					if r.ID != "" {
+						uids[r.ID] = true
+					}
+				}
+			}
+		}
+		_ = s.restDelete(ctx, "users", "email=eq."+url.QueryEscape(targetEmail))
+	}
+
+	for uid := range uids {
+		_, _ = s.firebaseAuthRPC(ctx, token, projectID, "/accounts:delete", map[string]any{"localId": uid})
+		_ = s.restDelete(ctx, "users", "id=eq."+url.QueryEscape(uid))
+		_ = s.firestoreDeleteUser(ctx, token, projectID, uid)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "message": "User deleted"})
 }
+
 
 // upsertSupabaseUserRow inserts or patches a Supabase users row by id.
 func (s *server) upsertSupabaseUserRow(ctx context.Context, uid string, data map[string]any) error {
