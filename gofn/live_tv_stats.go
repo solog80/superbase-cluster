@@ -40,43 +40,62 @@ type OMENativeResponse struct {
 
 // fetchOMENativeStats queries OvenMediaEngine's native REST API (/v1/stats/current/...) on port 8091.
 func (s *server) fetchOMENativeStats(ctx context.Context, subPath string) (*OMENativeResponse, error) {
-	omeHost := getenv("OME_API_HOST", "http://127.0.0.1:8091")
+	hosts := []string{
+		getenv("OME_API_HOST", ""),
+		"http://127.0.0.1:8091",
+		"http://172.27.0.1:8091",
+		"http://host.docker.internal:8091",
+		"http://198.204.224.170:8091",
+	}
 	omeToken := osGetenv("OME_ACCESS_TOKEN", "s4lt5tv_0me_api_2026")
 	if omeToken == "" {
 		omeToken = osGetenv("OME_API_TOKEN", "s4lt5tv_0me_api_2026")
 	}
 
-	targetURL := fmt.Sprintf("%s/v1/stats/current/vhosts/default/apps/app%s", omeHost, subPath)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
-	if err != nil {
-		return nil, err
-	}
+	var lastErr error
+	for _, omeHost := range hosts {
+		if omeHost == "" {
+			continue
+		}
+		targetURL := fmt.Sprintf("%s/v1/stats/current/vhosts/default/apps/app%s", omeHost, subPath)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
+		if err != nil {
+			lastErr = err
+			continue
+		}
 
-	if omeToken != "" {
-		encoded := base64.StdEncoding.EncodeToString([]byte(omeToken))
-		req.Header.Set("Authorization", "Basic "+encoded)
-	}
+		if omeToken != "" {
+			encoded := base64.StdEncoding.EncodeToString([]byte(omeToken))
+			req.Header.Set("Authorization", "Basic "+encoded)
+		}
 
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
+		resp, err := s.client.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
 
-	if resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("ome api status %d", resp.StatusCode)
-	}
+		if resp.StatusCode >= 300 {
+			_ = resp.Body.Close()
+			lastErr = fmt.Errorf("ome api status %d", resp.StatusCode)
+			continue
+		}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return nil, err
-	}
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		_ = resp.Body.Close()
+		if err != nil {
+			lastErr = err
+			continue
+		}
 
-	var out OMENativeResponse
-	if err := json.Unmarshal(body, &out); err != nil {
-		return nil, err
+		var out OMENativeResponse
+		if err := json.Unmarshal(body, &out); err != nil {
+			lastErr = err
+			continue
+		}
+		return &out, nil
 	}
-	return &out, nil
+	return nil, lastErr
 }
 
 // handleGetLiveTvStats retrieves native OvenMediaEngine metrics (totalConnections, llhls, webrtc, throughput)
