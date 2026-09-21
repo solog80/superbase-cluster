@@ -112,10 +112,8 @@ func (vt *VarnishWindowTracker) GetStats(windowDuration time.Duration) LiveStats
 
 	cutoff := time.Now().Add(-windowDuration)
 	streamCounts := map[string]int{
-		"stream":               0,
-		"stream2":              0,
-		"app/stream/abr.m3u8":  0,
-		"app/stream2/abr.m3u8": 0,
+		"stream":  0,
+		"stream2": 0,
 	}
 	total := 0
 
@@ -124,10 +122,8 @@ func (vt *VarnishWindowTracker) GetStats(windowDuration time.Duration) LiveStats
 			total++
 			if sess.Stream == "stream" {
 				streamCounts["stream"]++
-				streamCounts["app/stream/abr.m3u8"]++
 			} else if sess.Stream == "stream2" {
 				streamCounts["stream2"]++
-				streamCounts["app/stream2/abr.m3u8"]++
 			}
 		}
 	}
