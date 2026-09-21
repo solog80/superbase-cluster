@@ -106,6 +106,9 @@ func main() {
 	s.startChatScheduler()
 	s.startNotificationStaleCleanup()
 
+	go globalVarnishTracker.StartCleanupLoop(5*time.Second, 30*time.Second)
+	go startVarnishUDPListener(getenv("VARNISH_LOG_PORT", "8092"))
+
 	port := getenv("PORT", "8080")
 	log.Printf("salt-gofn listening on :%s rest=%s tsdb=%v", port, s.restURL, tsdb != nil)
 	if err := http.ListenAndServe(":"+port, mux); err != nil {
@@ -279,6 +282,8 @@ func (s *server) dispatch(w http.ResponseWriter, r *http.Request) {
 		s.handleGetViewerCountries(w, r)
 	case "getViewerPeak":
 		s.handleGetViewerPeak(w, r)
+	case "ingestVarnishLog":
+		s.handleIngestVarnishLog(w, r)
 	case "sendNotification", "getSentNotifications", "getLinkMetadata", "deleteNotification", "clearSentNotifications", "deleteNotifications":
 		if !s.isServiceKey(r) {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"success": false, "error": "Unauthorized: Admin access required"})
@@ -419,6 +424,7 @@ func (s *server) publicFn(name string) bool {
 		"getViewerStats",
 		"getViewerCountries",
 		"getViewerPeak",
+		"ingestVarnishLog",
 		"getRadioHistory",
 		"getRadioReports",
 		"getRadioCountryDetails",
