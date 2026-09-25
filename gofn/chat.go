@@ -131,6 +131,49 @@ func (s *server) runRadioChatManager(ctx context.Context) error {
 		}
 	}
 
+	// Active special events for radio/both
+	activeEventIDs := map[string]bool{}
+	rawEv, _, errEv := s.doRest(ctx, "events", url.Values{
+		"select": {"id,title,platform,enable_chat,start_date,end_date"},
+	})
+	if errEv == nil {
+		var events []struct {
+			ID         string `json:"id"`
+			Title      string `json:"title"`
+			Platform   string `json:"platform"`
+			StartDate  string `json:"start_date"`
+			EndDate    string `json:"end_date"`
+			EnableChat *bool  `json:"enable_chat"`
+		}
+		if json.Unmarshal(rawEv, &events) == nil {
+			for _, ev := range events {
+				if ev.EnableChat != nil && !*ev.EnableChat {
+					continue
+				}
+				if ev.Platform == "tv" {
+					continue
+				}
+				st, err1 := time.Parse(time.RFC3339, ev.StartDate)
+				et, err2 := time.Parse(time.RFC3339, ev.EndDate)
+				if err1 == nil && err2 == nil && !nowUtc.Before(st) && !nowUtc.After(et) {
+					activeEventIDs[ev.ID] = true
+					slugID := generateSlug(ev.Title)
+					if slugID != "" {
+						activeEventIDs[slugID] = true
+					}
+					_ = s.activateChatRoom(ctx, chatRoomRow{
+						ID: ev.ID, Kind: "radio", ProgramName: ev.Title, IsActive: true,
+					}, todayStr, true)
+					if slugID != "" && slugID != ev.ID {
+						_ = s.activateChatRoom(ctx, chatRoomRow{
+							ID: slugID, Kind: "radio", ProgramName: ev.Title, IsActive: true,
+						}, todayStr, true)
+					}
+				}
+			}
+		}
+	}
+
 	// Deactivate other radio rooms. PostgREST PATCH does not apply reliably to
 	// `neq`/`not.in` filters (intermittently returns 204 with no rows changed),
 	// so resolve the explicit id list first, then PATCH by id=in.(...).
@@ -149,7 +192,7 @@ func (s *server) runRadioChatManager(ctx context.Context) error {
 	}
 	toDeactivate := make([]string, 0, len(activeRows))
 	for _, r := range activeRows {
-		if r.ID != activeID {
+		if r.ID != activeID && !activeEventIDs[r.ID] {
 			toDeactivate = append(toDeactivate, r.ID)
 		}
 	}
@@ -189,6 +232,48 @@ func (s *server) runTvChatManager(ctx context.Context) error {
 	nowUtc := time.Now().UTC()
 	todayStr := nowUtc.Format("2006-01-02")
 	activeIDs := map[string]bool{}
+
+	// Active special events for TV/both
+	rawEv, _, errEv := s.doRest(ctx, "events", url.Values{
+		"select": {"id,title,platform,enable_chat,start_date,end_date"},
+	})
+	if errEv == nil {
+		var events []struct {
+			ID         string `json:"id"`
+			Title      string `json:"title"`
+			Platform   string `json:"platform"`
+			StartDate  string `json:"start_date"`
+			EndDate    string `json:"end_date"`
+			EnableChat *bool  `json:"enable_chat"`
+		}
+		if json.Unmarshal(rawEv, &events) == nil {
+			for _, ev := range events {
+				if ev.EnableChat != nil && !*ev.EnableChat {
+					continue
+				}
+				if ev.Platform == "radio" {
+					continue
+				}
+				st, err1 := time.Parse(time.RFC3339, ev.StartDate)
+				et, err2 := time.Parse(time.RFC3339, ev.EndDate)
+				if err1 == nil && err2 == nil && !nowUtc.Before(st) && !nowUtc.After(et) {
+					activeIDs[ev.ID] = true
+					slugID := generateSlug(ev.Title)
+					if slugID != "" {
+						activeIDs[slugID] = true
+					}
+					_ = s.activateChatRoom(ctx, chatRoomRow{
+						ID: ev.ID, Kind: "tv", ProgramName: ev.Title, IsActive: true,
+					}, todayStr, true)
+					if slugID != "" && slugID != ev.ID {
+						_ = s.activateChatRoom(ctx, chatRoomRow{
+							ID: slugID, Kind: "tv", ProgramName: ev.Title, IsActive: true,
+						}, todayStr, true)
+					}
+				}
+			}
+		}
+	}
 
 	for _, st := range stations {
 		raw, _, err := s.doRest(ctx, "epg_programs", url.Values{
