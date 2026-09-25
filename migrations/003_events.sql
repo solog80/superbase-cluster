@@ -3,16 +3,17 @@
 -- Run on the Supabase primary (us1) via psql.
 
 create table if not exists public.events (
-  id         text primary key default gen_random_uuid()::text,
-  title      text not null,
-  image_url  text,
-  presenter  text,
-  start_date timestamptz not null,
-  end_date   timestamptz not null,
-  platform   text not null default 'both',   -- 'tv' | 'radio' | 'both'
-  stations   jsonb not null default '[]'::jsonb,
-  created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now()
+  id          text primary key default gen_random_uuid()::text,
+  title       text not null,
+  image_url   text,
+  presenter   text,
+  start_date  timestamptz not null,
+  end_date    timestamptz not null,
+  platform    text not null default 'both',   -- 'tv' | 'radio' | 'both'
+  stations    jsonb not null default '[]'::jsonb,
+  enable_chat boolean not null default true,
+  created_at  timestamptz not null default now(),
+  updated_at  timestamptz not null default now()
 );
 
 create index if not exists events_platform_idx on public.events (platform, start_date desc);
