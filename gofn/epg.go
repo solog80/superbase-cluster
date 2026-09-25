@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -101,6 +102,76 @@ func parseHour(hm string) int {
 	return 0
 }
 
+type activeEventInfo struct {
+	ID         string
+	Title      string
+	Presenter  string
+	ImageURL   string
+	Platform   string
+	Stations   []string
+	EnableChat bool
+}
+
+func (s *server) fetchActiveEvents(ctx context.Context, now time.Time) []activeEventInfo {
+	raw, _, err := s.doRest(ctx, "events", url.Values{
+		"select": {"id,title,presenter,image_url,platform,stations,enable_chat,start_date,end_date"},
+	})
+	if err != nil {
+		log.Printf("[fetchActiveEvents] doRest error: %v", err)
+		return nil
+	}
+	var rows []map[string]any
+	if err := json.Unmarshal(raw, &rows); err != nil {
+		log.Printf("[fetchActiveEvents] unmarshal error: %v", err)
+		return nil
+	}
+	var active []activeEventInfo
+	for _, r := range rows {
+		if ec, ok := r["enable_chat"].(bool); ok && !ec {
+			continue
+		}
+		sdStr, _ := r["start_date"].(string)
+		edStr, _ := r["end_date"].(string)
+		st, err1 := parseIsoTime(sdStr)
+		et, err2 := parseIsoTime(edStr)
+		if err1 != nil || err2 != nil {
+			log.Printf("[fetchActiveEvents] time parse error: st=%v et=%v (sd=%s ed=%s)", err1, err2, sdStr, edStr)
+			continue
+		}
+		if !now.Before(st) && !now.After(et) {
+			id, _ := r["id"].(string)
+			title, _ := r["title"].(string)
+			presenter, _ := r["presenter"].(string)
+			imageURL, _ := r["image_url"].(string)
+			platform, _ := r["platform"].(string)
+
+			var stations []string
+			if stns, ok := r["stations"].([]any); ok {
+				for _, sItem := range stns {
+					if str, ok := sItem.(string); ok {
+						stations = append(stations, str)
+					}
+				}
+			}
+			enableChat := true
+			if ec, ok := r["enable_chat"].(bool); ok {
+				enableChat = ec
+			}
+			active = append(active, activeEventInfo{
+				ID:         id,
+				Title:      title,
+				Presenter:  presenter,
+				ImageURL:   imageURL,
+				Platform:   platform,
+				Stations:   stations,
+				EnableChat: enableChat,
+			})
+			log.Printf("✅ [fetchActiveEvents] Found active event: %s (%s)", id, title)
+		}
+	}
+	return active
+}
+
 // buildEPGPayload assembles the exact getEPGData response shape:
 //
 //	{ data: { tv: { stationKey: {stationImageUrl,... programs:[...] } },
@@ -108,18 +179,55 @@ func parseHour(hm string) int {
 //
 // TV stations are keyed by station id; radio is a single object. Only
 // stations that are visible and have today's programs are included.
-func (s *server) buildEPGPayload(stations []epgStation, programs []epgProgram, dayName string, now time.Time) map[string]any {
+func (s *server) buildEPGPayload(ctx context.Context, stations []epgStation, programs []epgProgram, dayName string, now time.Time) map[string]any {
 	yesterday := now.AddDate(0, 0, -1)
 	yesterdayDay := yesterday.UTC().Format("Monday")
 
 	radioStation := map[string]any{}
 	tvData := map[string]any{}
 
+	activeEvents := s.fetchActiveEvents(ctx, now)
+
 	for _, st := range stations {
 		if !st.IsVisible {
 			continue
 		}
 		stationPrograms := filterPrograms(programs, st.ID, dayName, yesterdayDay)
+
+		// Prepend active special events targeting this station
+		for _, ev := range activeEvents {
+			if ev.Platform != "both" && ev.Platform != st.LineupType {
+				continue
+			}
+			matchesStation := len(ev.Stations) == 0
+			if !matchesStation {
+				for _, sName := range ev.Stations {
+					if strings.EqualFold(sName, st.ID) {
+						matchesStation = true
+						break
+					}
+				}
+			}
+			if matchesStation {
+				eventProg := map[string]any{
+					"tvProgramId":    ev.ID,
+					"programName":    ev.Title,
+					"presenter":      ev.Presenter,
+					"genre":          "Special Event",
+					"details":        "",
+					"language":       "English",
+					"startTime":      "00:00",
+					"endTime":        "23:59",
+					"days":           dayName,
+					"isInterruptive": true,
+					"shouldShow":     true,
+					"enableChat":     ev.EnableChat,
+					"image":          ev.ImageURL,
+					"thumbnail":      ev.ImageURL,
+				}
+				stationPrograms = append([]map[string]any{eventProg}, stationPrograms...)
+			}
+		}
 
 		// Radio: single object keyed by nothing — build separately.
 		if st.LineupType == "radio" {
@@ -227,14 +335,16 @@ func (s *server) handleGetEPGData(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().UTC()
 	dateKey := now.Format("2006-01-02")
 
-	s.epgMu.Lock()
-	if e, ok := s.epgCache[dateKey]; ok && time.Now().Before(e.expiresAt) {
+	if r.URL.Query().Get("nocache") != "true" {
+		s.epgMu.Lock()
+		if e, ok := s.epgCache[dateKey]; ok && time.Now().Before(e.expiresAt) {
+			s.epgMu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(e.payload)
+			return
+		}
 		s.epgMu.Unlock()
-		w.Header().Set("Content-Type", "application/json")
-		w.Write(e.payload)
-		return
 	}
-	s.epgMu.Unlock()
 
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
@@ -245,14 +355,14 @@ func (s *server) handleGetEPGData(w http.ResponseWriter, r *http.Request) {
 	}
 
 	dayName := now.Format("Monday")
-	payload := s.buildEPGPayload(stations, programs, dayName, now)
+	payload := s.buildEPGPayload(ctx, stations, programs, dayName, now)
 	payload["source"] = "db"
 	payload["cached"] = false
 	payload["timestamp"] = now.Format(time.RFC3339)
 
 	raw, _ := json.Marshal(payload)
 	s.epgMu.Lock()
-	s.epgCache[dateKey] = epgCacheEntry{payload: raw, expiresAt: time.Now().Add(24 * time.Hour)}
+	s.epgCache[dateKey] = epgCacheEntry{payload: raw, expiresAt: time.Now().Add(5 * time.Minute)}
 	s.epgMu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")

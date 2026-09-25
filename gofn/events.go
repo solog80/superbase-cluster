@@ -114,6 +114,7 @@ func (s *server) handleAddEvent(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
+	s.clearEPGCache()
 	writeJSON(w, http.StatusOK, map[string]any{"success": true})
 }
 
@@ -183,6 +184,7 @@ func (s *server) handleUpdateEvent(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
+	s.clearEPGCache()
 	writeJSON(w, http.StatusOK, map[string]any{"success": true})
 }
 
@@ -205,5 +207,6 @@ func (s *server) handleDeleteEvent(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
+	s.clearEPGCache()
 	writeJSON(w, http.StatusOK, map[string]any{"success": true})
 }

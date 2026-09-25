@@ -99,6 +99,26 @@ func activeProgramAt(programs []epgProgramRow, nowUtc time.Time) (epgProgramRow,
 	return epgProgramRow{}, false
 }
 
+func parseIsoTime(s string) (time.Time, error) {
+	s = strings.TrimSpace(s)
+	formats := []string{
+		time.RFC3339,
+		"2006-01-02T15:04:05Z07:00",
+		"2006-01-02T15:04:05Z0700",
+		"2006-01-02T15:04:05Z07",
+		"2006-01-02 15:04:05Z07:00",
+		"2006-01-02 15:04:05Z07",
+		"2006-01-02 15:04:05+00",
+		"2006-01-02 15:04:05",
+	}
+	for _, f := range formats {
+		if t, err := time.Parse(f, s); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("cannot parse time: %s", s)
+}
+
 func (s *server) runRadioChatManager(ctx context.Context) error {
 	// Read the radio lineup (Live_Radio station + its programs).
 	raw, _, err := s.doRest(ctx, "epg_programs", url.Values{
@@ -111,9 +131,6 @@ func (s *server) runRadioChatManager(ctx context.Context) error {
 	var programs []epgProgramRow
 	if err := json.Unmarshal(raw, &programs); err != nil {
 		return err
-	}
-	if len(programs) == 0 {
-		return nil
 	}
 
 	nowUtc := time.Now().UTC()
@@ -153,14 +170,15 @@ func (s *server) runRadioChatManager(ctx context.Context) error {
 				if ev.Platform == "tv" {
 					continue
 				}
-				st, err1 := time.Parse(time.RFC3339, ev.StartDate)
-				et, err2 := time.Parse(time.RFC3339, ev.EndDate)
+				st, err1 := parseIsoTime(ev.StartDate)
+				et, err2 := parseIsoTime(ev.EndDate)
 				if err1 == nil && err2 == nil && !nowUtc.Before(st) && !nowUtc.After(et) {
 					activeEventIDs[ev.ID] = true
 					slugID := generateSlug(ev.Title)
 					if slugID != "" {
 						activeEventIDs[slugID] = true
 					}
+					log.Printf("chat radio manager: active special event chat = %s (%s)", ev.ID, ev.Title)
 					_ = s.activateChatRoom(ctx, chatRoomRow{
 						ID: ev.ID, Kind: "radio", ProgramName: ev.Title, IsActive: true,
 					}, todayStr, true)
@@ -254,14 +272,15 @@ func (s *server) runTvChatManager(ctx context.Context) error {
 				if ev.Platform == "radio" {
 					continue
 				}
-				st, err1 := time.Parse(time.RFC3339, ev.StartDate)
-				et, err2 := time.Parse(time.RFC3339, ev.EndDate)
+				st, err1 := parseIsoTime(ev.StartDate)
+				et, err2 := parseIsoTime(ev.EndDate)
 				if err1 == nil && err2 == nil && !nowUtc.Before(st) && !nowUtc.After(et) {
 					activeIDs[ev.ID] = true
 					slugID := generateSlug(ev.Title)
 					if slugID != "" {
 						activeIDs[slugID] = true
 					}
+					log.Printf("chat tv manager: active special event chat = %s (%s)", ev.ID, ev.Title)
 					_ = s.activateChatRoom(ctx, chatRoomRow{
 						ID: ev.ID, Kind: "tv", ProgramName: ev.Title, IsActive: true,
 					}, todayStr, true)
