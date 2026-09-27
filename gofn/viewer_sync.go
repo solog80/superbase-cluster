@@ -45,11 +45,12 @@ SELECT
     ELSE 'Other'
   END AS browser,
   COALESCE(NULLIF(country, ''), 'Unknown') AS country,
+  COALESCE(NULLIF(isp, ''), 'Cellular/Broadband') AS isp,
   COUNT(*) AS requests,
   COUNT(DISTINCT COALESCE(NULLIF(session, ''), client_ip)) AS distinct_sessions
 FROM ` + "`salt-media-app1.viewer_logs.viewer_requests_native`" + `
 WHERE DATE(ts) = '{day}' AND COALESCE(is_datacenter, false) = false
-GROUP BY day, device_type, os, browser, country`
+GROUP BY day, device_type, os, browser, country, isp`
 
 // syncViewerDay aggregates one day of CDN viewer requests from BigQuery into
 // the TSDB viewer_daily table (upsert by natural key).
@@ -65,22 +66,26 @@ func (s *server) syncViewerDay(ctx context.Context, day string) error {
 	for _, r := range rows {
 		requests, _ := strconv.ParseInt(str(r["requests"]), 10, 64)
 		sessionsN, _ := strconv.ParseInt(str(r["distinct_sessions"]), 10, 64)
+		isp := str(r["isp"])
+		if isp == "" {
+			isp = "Cellular/Broadband"
+		}
 		if _, err := db.ExecContext(ctx, `
-			INSERT INTO public.viewer_daily (day, device_type, os, browser, country, requests, distinct_sessions, updated_at)
-			VALUES ($1,$2,$3,$4,$5,$6,$7, now())
-			ON CONFLICT (day, device_type, os, browser, country)
+			INSERT INTO public.viewer_daily (day, device_type, os, browser, country, isp, requests, distinct_sessions, updated_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8, now())
+			ON CONFLICT (day, device_type, os, browser, country, isp)
 			DO UPDATE SET requests = EXCLUDED.requests, distinct_sessions = EXCLUDED.distinct_sessions, updated_at = now()`,
-			day, str(r["device_type"]), str(r["os"]), str(r["browser"]), str(r["country"]), requests, sessionsN); err != nil {
+			day, str(r["device_type"]), str(r["os"]), str(r["browser"]), str(r["country"]), isp, requests, sessionsN); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// backfillViewerDaily syncs the last N days (excluding today) so the dashboard
+// backfillViewerDaily syncs the last N days so the dashboard
 // has history before the hourly live sync takes over.
 func (s *server) backfillViewerDaily(ctx context.Context, days int) {
-	for i := days; i >= 1; i-- {
+	for i := days; i >= 0; i-- {
 		day := time.Now().UTC().AddDate(0, 0, -i).Format("2006-01-02")
 		if err := s.syncViewerDay(ctx, day); err != nil {
 			log.Printf("viewer backfill %s: %v", day, err)
@@ -88,4 +93,13 @@ func (s *server) backfillViewerDaily(ctx context.Context, days int) {
 			log.Printf("viewer backfill %s: ok", day)
 		}
 	}
+}
+
+// handleSyncViewerDaily allows manual triggering of viewer daily sync from BigQuery.
+func (s *server) handleSyncViewerDaily(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
+	defer cancel()
+	days := atoiDefault(r.URL.Query().Get("days"), 7)
+	s.backfillViewerDaily(ctx, days)
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "synced_days": days})
 }

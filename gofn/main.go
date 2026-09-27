@@ -282,6 +282,8 @@ func (s *server) dispatch(w http.ResponseWriter, r *http.Request) {
 		s.handleGetViewerCountries(w, r)
 	case "getViewerPeak":
 		s.handleGetViewerPeak(w, r)
+	case "syncViewerDaily":
+		s.handleSyncViewerDaily(w, r)
 	case "ingestVarnishLog":
 		s.handleIngestVarnishLog(w, r)
 	case "sendNotification", "getSentNotifications", "getLinkMetadata", "deleteNotification", "clearSentNotifications", "deleteNotifications":
@@ -424,6 +426,7 @@ func (s *server) publicFn(name string) bool {
 		"getViewerStats",
 		"getViewerCountries",
 		"getViewerPeak",
+		"syncViewerDaily",
 		"ingestVarnishLog",
 		"getRadioHistory",
 		"getRadioReports",

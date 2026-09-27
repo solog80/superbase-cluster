@@ -186,36 +186,41 @@ func osGetenv(key, fallback string) string {
 // handleGetViewerStats retrieves viewer statistics per stream over recent minutes or date range from TSDB.
 func (s *server) handleGetViewerStats(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	minutes := atoiDefault(q.Get("minutes"), 30)
+	minutes := atoiDefault(q.Get("minutes"), 60)
 	startDate := strings.TrimSpace(q.Get("startDate"))
 	endDate := strings.TrimSpace(q.Get("endDate"))
 
-	// If requested window is > 24 hours (1440 mins) or specific date range provided, query TimescaleDB
-	if (minutes > 1440 || startDate != "" || endDate != "") && s.tsdb != nil {
+	if s.tsdb != nil {
 		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 		defer cancel()
 
 		if db, err := s.tsdbDB(ctx); err == nil {
-			bucket := "1 hour"
-			if minutes > 10080 { // > 7 days -> bucket by day
+			bucket := "1 minute"
+			if minutes > 180 {
+				bucket = "5 minutes"
+			}
+			if minutes > 1440 {
+				bucket = "1 hour"
+			}
+			if minutes > 10080 {
 				bucket = "1 day"
 			}
 			var timeWhere string
 			var args []any
 
 			if startDate != "" && endDate != "" {
-				timeWhere = "timestamp >= $1::timestamptz AND timestamp <= ($2::date + interval '1 day')::timestamptz"
+				timeWhere = "received_at >= $1::timestamptz AND received_at <= ($2::date + interval '1 day')::timestamptz"
 				args = append(args, startDate, endDate)
 			} else {
-				timeWhere = "timestamp >= now() - ($1 * interval '1 minute')"
+				timeWhere = "received_at >= now() - ($1 * interval '1 minute')"
 				args = append(args, minutes)
 			}
 
 			query := fmt.Sprintf(`
-				SELECT time_bucket('%s', timestamp) as bucket_time,
+				SELECT time_bucket('%s', received_at) as bucket_time,
 				       case when content_id like '%%stream2%%' or content_id like '%%salt_tv_two%%' then 'stream2' else 'stream' end as st,
 				       count(distinct coalesce(user_id, device_id)) as v
-				FROM public.content_sessions
+				FROM public.content_views
 				WHERE %s
 				GROUP BY 1, 2
 				ORDER BY 1 ASC`, bucket, timeWhere)
@@ -265,7 +270,7 @@ func (s *server) handleGetViewerStats(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleGetViewerCountries queries viewer country and ISP breakdowns dynamically from active Varnish sessions.
+// handleGetViewerCountries queries viewer country and ISP breakdowns dynamically from active Varnish sessions or TSDB GeoIP.
 func (s *server) handleGetViewerCountries(w http.ResponseWriter, r *http.Request) {
 	minutes := atoiDefault(r.URL.Query().Get("minutes"), 60)
 	if minutes < 1 {
@@ -312,9 +317,6 @@ func (s *server) handleGetViewerCountries(w http.ResponseWriter, r *http.Request
 			Viewers: count,
 		})
 	}
-	sort.Slice(countries, func(i, j int) bool {
-		return countries[i].Viewers > countries[j].Viewers
-	})
 
 	type ispItem struct {
 		Code    string `json:"code"`
@@ -329,6 +331,60 @@ func (s *server) handleGetViewerCountries(w http.ResponseWriter, r *http.Request
 			Viewers: count,
 		})
 	}
+
+	// Dynamic fallback from TimescaleDB viewer_daily table (populated by GeoIP CDN processing)
+	if len(countries) == 0 && s.tsdb != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+
+		if db, err := s.tsdbDB(ctx); err == nil {
+			rows, err := db.QueryContext(ctx, `
+				SELECT country, sum(distinct_sessions)::int as sessions
+				FROM public.viewer_daily
+				WHERE day >= (now() - interval '30 days')::date AND country <> 'Unknown'
+				GROUP BY 1 ORDER BY 2 DESC LIMIT 20`)
+			if err == nil {
+				defer rows.Close()
+				for rows.Next() {
+					var cName string
+					var sess int
+					if err := rows.Scan(&cName, &sess); err == nil {
+						code := getIsoCode(cName)
+						countries = append(countries, countryItem{
+							Code:    code,
+							Country: cName,
+							Viewers: sess,
+						})
+					}
+				}
+			}
+
+			rowsIsp, errIsp := db.QueryContext(ctx, `
+				SELECT country, isp, sum(distinct_sessions)::int as sessions
+				FROM public.viewer_daily
+				WHERE day >= (now() - interval '30 days')::date AND country <> 'Unknown' AND isp <> 'Unknown' AND isp <> ''
+				GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 20`)
+			if errIsp == nil {
+				defer rowsIsp.Close()
+				for rowsIsp.Next() {
+					var cName, ispName string
+					var sess int
+					if err := rowsIsp.Scan(&cName, &ispName, &sess); err == nil {
+						code := getIsoCode(cName)
+						isps = append(isps, ispItem{
+							Code:    code,
+							ISP:     ispName,
+							Viewers: sess,
+						})
+					}
+				}
+			}
+		}
+	}
+
+	sort.Slice(countries, func(i, j int) bool {
+		return countries[i].Viewers > countries[j].Viewers
+	})
 	sort.Slice(isps, func(i, j int) bool {
 		return isps[i].Viewers > isps[j].Viewers
 	})
@@ -351,8 +407,46 @@ func (s *server) handleGetViewerCountries(w http.ResponseWriter, r *http.Request
 		"countries": countries,
 		"isps":      isps,
 		"minutes":   minutes,
-		"source":    "varnish_geoip_realtime",
+		"source":    "timescaledb_geoip",
 	})
+}
+
+var isoCountryCodes = map[string]string{
+	"uganda":               "UG",
+	"saudi arabia":         "SA",
+	"united arab emirates": "AE",
+	"united states":        "US",
+	"united kingdom":       "GB",
+	"china":                "CN",
+	"qatar":                "QA",
+	"kenya":                "KE",
+	"seychelles":           "SC",
+	"germany":              "DE",
+	"canada":               "CA",
+	"jordan":               "JO",
+	"the netherlands":      "NL",
+	"netherlands":          "NL",
+	"france":               "FR",
+	"rwanda":               "RW",
+	"bahrain":              "BH",
+	"south africa":         "ZA",
+	"singapore":            "SG",
+	"kuwait":               "KW",
+	"somalia":              "SO",
+	"south sudan":          "SS",
+	"tanzania":             "TZ",
+	"sweden":               "SE",
+	"italy":                "IT",
+}
+
+func getIsoCode(cName string) string {
+	if code, ok := isoCountryCodes[strings.ToLower(strings.TrimSpace(cName))]; ok {
+		return code
+	}
+	if len(cName) == 2 {
+		return strings.ToUpper(cName)
+	}
+	return "UG"
 }
 
 // handleGetViewerPeak queries peak concurrent real viewers and current distinct 30s Varnish viewers.
