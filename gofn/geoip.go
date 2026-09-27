@@ -18,10 +18,14 @@ import (
 )
 
 type GeoInfo struct {
-	CountryCode  string `json:"code"`
-	CountryName  string `json:"country"`
-	ISP          string `json:"isp"`
-	IsDatacenter bool   `json:"is_dc"`
+	CountryCode  string  `json:"code"`
+	CountryName  string  `json:"country"`
+	City         string  `json:"city"`
+	Region       string  `json:"region"`
+	Lat          float64 `json:"lat"`
+	Lon          float64 `json:"lon"`
+	ISP          string  `json:"isp"`
+	IsDatacenter bool    `json:"is_dc"`
 }
 
 type GeoIPService struct {
@@ -231,6 +235,10 @@ func (s *GeoIPService) Lookup(ipStr string) GeoInfo {
 		return GeoInfo{
 			CountryCode:  "UG",
 			CountryName:  "Uganda",
+			City:         "Kampala",
+			Region:       "Central Region",
+			Lat:          0.31628,
+			Lon:          32.58219,
 			ISP:          "Local Network",
 			IsDatacenter: false,
 		}
@@ -243,20 +251,23 @@ func (s *GeoIPService) Lookup(ipStr string) GeoInfo {
 		return info
 	}
 
-	var cc, cname string
+	var cc, cname, city, region string
+	var lat, lon float64
+
 	if s.db != nil {
 		parsedIP := net.ParseIP(ipStr)
 		if parsedIP != nil {
 			if record, err := s.db.City(parsedIP); err == nil {
 				cc = record.Country.IsoCode
 				cname = record.Country.Names["en"]
+				city = record.City.Names["en"]
 			}
 		}
 	}
 
 	isp := ""
 	isDC := false
-	apiURL := fmt.Sprintf("http://ip-api.com/json/%s?fields=status,countryCode,country,isp,hosting", ipStr)
+	apiURL := fmt.Sprintf("http://ip-api.com/json/%s?fields=status,countryCode,country,regionName,city,lat,lon,isp,hosting", ipStr)
 	req, err := http.NewRequest(http.MethodGet, apiURL, nil)
 	if err == nil {
 		resp, err := s.httpClient.Do(req)
@@ -265,11 +276,15 @@ func (s *GeoIPService) Lookup(ipStr string) GeoInfo {
 			if resp.StatusCode == 200 {
 				body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
 				var apiResp struct {
-					Status      string `json:"status"`
-					CountryCode string `json:"countryCode"`
-					Country     string `json:"country"`
-					ISP         string `json:"isp"`
-					Hosting     bool   `json:"hosting"`
+					Status      string  `json:"status"`
+					CountryCode string  `json:"countryCode"`
+					Country     string  `json:"country"`
+					RegionName  string  `json:"regionName"`
+					City        string  `json:"city"`
+					Lat         float64 `json:"lat"`
+					Lon         float64 `json:"lon"`
+					ISP         string  `json:"isp"`
+					Hosting     bool    `json:"hosting"`
 				}
 				if err := json.Unmarshal(body, &apiResp); err == nil && apiResp.Status == "success" {
 					if cc == "" {
@@ -277,6 +292,18 @@ func (s *GeoIPService) Lookup(ipStr string) GeoInfo {
 					}
 					if cname == "" {
 						cname = apiResp.Country
+					}
+					if city == "" {
+						city = apiResp.City
+					}
+					if region == "" {
+						region = apiResp.RegionName
+					}
+					if lat == 0 {
+						lat = apiResp.Lat
+					}
+					if lon == 0 {
+						lon = apiResp.Lon
 					}
 					isp = normalizeISPName(apiResp.ISP)
 					isDC = apiResp.Hosting
@@ -291,22 +318,16 @@ func (s *GeoIPService) Lookup(ipStr string) GeoInfo {
 	if cname == "" {
 		cname = "Uganda"
 	}
-	if isp == "" {
-		isp = "Broadband Provider"
+	if city == "" {
+		city = "Kampala"
 	}
-
-	dcKeywords := []string{"hetzner", "digitalocean", "vultr", "linode", "contabo", "ovh", "scaleway", "upcloud", "amazon", "amazonaws", "azure", "google", "cloudflare", "fastly", "akamai", "hosting", "datacenter", "vps"}
-	ispLower := strings.ToLower(isp)
-	for _, kw := range dcKeywords {
-		if strings.Contains(ispLower, kw) {
-			isDC = true
-			break
-		}
-	}
-
 	info = GeoInfo{
 		CountryCode:  cc,
 		CountryName:  cname,
+		City:         city,
+		Region:       region,
+		Lat:          lat,
+		Lon:          lon,
 		ISP:          isp,
 		IsDatacenter: isDC,
 	}
@@ -316,23 +337,6 @@ func (s *GeoIPService) Lookup(ipStr string) GeoInfo {
 	s.mu.Unlock()
 
 	return info
-}
-
-func isDatacenterISP(isp string) bool {
-	lower := strings.ToLower(isp)
-	dcKeywords := []string{
-		"hetzner", "digitalocean", "vultr", "linode", "contabo", "ovh", "scaleway",
-		"upcloud", "amazon", "amazonaws", "aws", "azure", "google", "cloudflare", "fastly",
-		"akamai", "hosting", "datacenter", "vps", "microsoft", "m247", "zscaler", "datacamp",
-		"railway", "tencent", "huawei cloud", "alibaba", "oracle cloud", "fly.io", "render",
-		"leaseweb", "choopa", "hostinger", "godaddy", "namecheap", "equinix", "interserver",
-	}
-	for _, kw := range dcKeywords {
-		if strings.Contains(lower, kw) {
-			return true
-		}
-	}
-	return false
 }
 
 // GetCountryISPBreakdown dynamically aggregates real ISP frequencies for a given country
@@ -345,12 +349,12 @@ func (s *GeoIPService) GetCountryISPBreakdown(cName string, totalViewers int) []
 	counts := make(map[string]int)
 	totalKnownIPs := 0
 	for _, info := range s.cache {
-		if info.IsDatacenter || isDatacenterISP(info.ISP) {
+		if info.IsDatacenter {
 			continue
 		}
 		if strings.ToLower(strings.TrimSpace(info.CountryName)) == cNameLower || strings.ToLower(strings.TrimSpace(info.CountryCode)) == cNameLower {
 			isp := normalizeISPName(info.ISP)
-			if isp != "" && isp != "Broadband Provider" && isp != "Local Network" && !isDatacenterISP(isp) {
+			if isp != "" && isp != "Broadband Provider" && isp != "Local Network" {
 				counts[isp]++
 				totalKnownIPs++
 			}
@@ -389,6 +393,74 @@ func (s *GeoIPService) GetCountryISPBreakdown(cName string, totalViewers int) []
 		items = append(items, ispItem{
 			Code:    code,
 			ISP:     sorted[i].isp,
+			Viewers: v,
+		})
+	}
+	if len(items) > 0 && allocated < totalViewers {
+		items[0].Viewers += (totalViewers - allocated)
+	}
+	return items
+}
+
+// GetCountryCityBreakdown dynamically aggregates real city frequencies for a given country
+// from the loaded GeoIP cache and scales them to totalViewers.
+func (s *GeoIPService) GetCountryCityBreakdown(cName string, totalViewers int) []cityItem {
+	code := getIsoCode(cName)
+	cNameLower := strings.ToLower(strings.TrimSpace(cName))
+
+	s.mu.RLock()
+	counts := make(map[string]int)
+	totalKnownIPs := 0
+	for _, info := range s.cache {
+		if info.IsDatacenter {
+			continue
+		}
+		if strings.ToLower(strings.TrimSpace(info.CountryName)) == cNameLower || strings.ToLower(strings.TrimSpace(info.CountryCode)) == cNameLower {
+			city := info.City
+			if city != "" && city != "-" {
+				counts[city]++
+				totalKnownIPs++
+			}
+		}
+	}
+	s.mu.RUnlock()
+
+	if totalKnownIPs == 0 || len(counts) == 0 {
+		defaultCity := "Kampala"
+		if code != "UG" {
+			defaultCity = cName
+		}
+		return []cityItem{{Code: code, Country: cName, City: defaultCity, Viewers: totalViewers}}
+	}
+
+	type kv struct {
+		city  string
+		count int
+	}
+	var sorted []kv
+	for k, v := range counts {
+		sorted = append(sorted, kv{city: k, count: v})
+	}
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].count > sorted[j].count
+	})
+
+	var items []cityItem
+	allocated := 0
+	limit := 20
+	if len(sorted) < limit {
+		limit = len(sorted)
+	}
+	for i := 0; i < limit; i++ {
+		v := int(float64(sorted[i].count) / float64(totalKnownIPs) * float64(totalViewers))
+		if v < 1 {
+			v = 1
+		}
+		allocated += v
+		items = append(items, cityItem{
+			Code:    code,
+			Country: cName,
+			City:    sorted[i].city,
 			Viewers: v,
 		})
 	}

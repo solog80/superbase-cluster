@@ -284,13 +284,20 @@ type countryItem struct {
 	Viewers int    `json:"viewers"`
 }
 
+type cityItem struct {
+	Code    string `json:"code"`
+	Country string `json:"country"`
+	City    string `json:"city"`
+	Viewers int    `json:"viewers"`
+}
+
 type ispItem struct {
 	Code    string `json:"code"`
 	ISP     string `json:"isp"`
 	Viewers int    `json:"viewers"`
 }
 
-// handleGetViewerCountries queries viewer country and ISP breakdowns dynamically from active Varnish sessions or TSDB GeoIP.
+// handleGetViewerCountries queries viewer country, city, and ISP breakdowns dynamically from active Varnish sessions or TSDB GeoIP.
 func (s *server) handleGetViewerCountries(w http.ResponseWriter, r *http.Request) {
 	minutes := atoiDefault(r.URL.Query().Get("minutes"), 60)
 	if minutes < 1 {
@@ -306,13 +313,18 @@ func (s *server) handleGetViewerCountries(w http.ResponseWriter, r *http.Request
 	countryCodeMap := make(map[string]string)
 	countryNameMap := make(map[string]string)
 
+	cityCounts := make(map[string]int)
+	cityCodeMap := make(map[string]string)
+	cityNameMap := make(map[string]string)
+	cityCountryMap := make(map[string]string)
+
 	ispCounts := make(map[string]int)
 	ispCodeMap := make(map[string]string)
 	ispNameMap := make(map[string]string)
 
 	for _, ip := range activeIPs {
 		geo := globalGeoIPService.Lookup(ip)
-		if geo.IsDatacenter || isDatacenterISP(geo.ISP) {
+		if geo.IsDatacenter {
 			continue
 		}
 
@@ -321,8 +333,16 @@ func (s *server) handleGetViewerCountries(w http.ResponseWriter, r *http.Request
 		countryCodeMap[cKey] = geo.CountryCode
 		countryNameMap[cKey] = geo.CountryName
 
+		if geo.City != "" && geo.City != "-" {
+			ciKey := fmt.Sprintf("%s:%s", geo.CountryCode, geo.City)
+			cityCounts[ciKey]++
+			cityCodeMap[ciKey] = geo.CountryCode
+			cityNameMap[ciKey] = geo.City
+			cityCountryMap[ciKey] = geo.CountryName
+		}
+
 		ispName := normalizeISPName(geo.ISP)
-		if ispName != "" && !isDatacenterISP(ispName) {
+		if ispName != "" {
 			iKey := fmt.Sprintf("%s:%s", geo.CountryCode, ispName)
 			ispCounts[iKey]++
 			ispCodeMap[iKey] = geo.CountryCode
@@ -335,6 +355,16 @@ func (s *server) handleGetViewerCountries(w http.ResponseWriter, r *http.Request
 		countries = append(countries, countryItem{
 			Code:    countryCodeMap[k],
 			Country: countryNameMap[k],
+			Viewers: count,
+		})
+	}
+
+	var cities []cityItem
+	for k, count := range cityCounts {
+		cities = append(cities, cityItem{
+			Code:    cityCodeMap[k],
+			Country: cityCountryMap[k],
+			City:    cityNameMap[k],
 			Viewers: count,
 		})
 	}
@@ -371,6 +401,8 @@ func (s *server) handleGetViewerCountries(w http.ResponseWriter, r *http.Request
 							Country: cName,
 							Viewers: sess,
 						})
+						cItems := globalGeoIPService.GetCountryCityBreakdown(cName, sess)
+						cities = append(cities, cItems...)
 					}
 				}
 			}
@@ -388,9 +420,6 @@ func (s *server) handleGetViewerCountries(w http.ResponseWriter, r *http.Request
 					if err := rowsIsp.Scan(&cName, &ispName, &sess); err == nil {
 						code := getIsoCode(cName)
 						normName := normalizeISPName(ispName)
-						if isDatacenterISP(normName) || isDatacenterISP(ispName) {
-							continue
-						}
 						if normName == "Cellular/Broadband" || normName == "" {
 							items := globalGeoIPService.GetCountryISPBreakdown(cName, sess)
 							isps = append(isps, items...)
@@ -410,12 +439,18 @@ func (s *server) handleGetViewerCountries(w http.ResponseWriter, r *http.Request
 	sort.Slice(countries, func(i, j int) bool {
 		return countries[i].Viewers > countries[j].Viewers
 	})
+	sort.Slice(cities, func(i, j int) bool {
+		return cities[i].Viewers > cities[j].Viewers
+	})
 	sort.Slice(isps, func(i, j int) bool {
 		return isps[i].Viewers > isps[j].Viewers
 	})
 
 	if len(countries) > 20 {
 		countries = countries[:20]
+	}
+	if len(cities) > 100 {
+		cities = cities[:100]
 	}
 	if len(isps) > 100 {
 		isps = isps[:100]
@@ -424,12 +459,16 @@ func (s *server) handleGetViewerCountries(w http.ResponseWriter, r *http.Request
 	if countries == nil {
 		countries = []countryItem{}
 	}
+	if cities == nil {
+		cities = []cityItem{}
+	}
 	if isps == nil {
 		isps = []ispItem{}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"countries": countries,
+		"cities":    cities,
 		"isps":      isps,
 		"minutes":   minutes,
 		"source":    "timescaledb_geoip",
