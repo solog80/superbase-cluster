@@ -207,9 +207,6 @@ func (s *GeoIPService) Lookup(ipStr string) GeoInfo {
 	if cname == "" {
 		cname = "Uganda"
 	}
-	if city == "" {
-		city = "Kampala"
-	}
 	if isp == "" {
 		isp = "Broadband Provider"
 	}
@@ -319,11 +316,7 @@ func (s *GeoIPService) GetCountryCityBreakdown(cName string, totalViewers int) [
 	s.mu.RUnlock()
 
 	if totalKnownIPs == 0 || len(counts) == 0 {
-		defaultCity := "Kampala"
-		if code != "UG" {
-			defaultCity = cName
-		}
-		return []cityItem{{Code: code, Country: cName, City: defaultCity, Viewers: totalViewers}}
+		return []cityItem{}
 	}
 
 	type kv struct {
