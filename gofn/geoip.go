@@ -318,6 +318,23 @@ func (s *GeoIPService) Lookup(ipStr string) GeoInfo {
 	return info
 }
 
+func isDatacenterISP(isp string) bool {
+	lower := strings.ToLower(isp)
+	dcKeywords := []string{
+		"hetzner", "digitalocean", "vultr", "linode", "contabo", "ovh", "scaleway",
+		"upcloud", "amazon", "amazonaws", "aws", "azure", "google", "cloudflare", "fastly",
+		"akamai", "hosting", "datacenter", "vps", "microsoft", "m247", "zscaler", "datacamp",
+		"railway", "tencent", "huawei cloud", "alibaba", "oracle cloud", "fly.io", "render",
+		"leaseweb", "choopa", "hostinger", "godaddy", "namecheap", "equinix", "interserver",
+	}
+	for _, kw := range dcKeywords {
+		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+	return false
+}
+
 // GetCountryISPBreakdown dynamically aggregates real ISP frequencies for a given country
 // from the loaded 37k+ GeoIP TSV cache and scales them to totalViewers.
 func (s *GeoIPService) GetCountryISPBreakdown(cName string, totalViewers int) []ispItem {
@@ -328,9 +345,12 @@ func (s *GeoIPService) GetCountryISPBreakdown(cName string, totalViewers int) []
 	counts := make(map[string]int)
 	totalKnownIPs := 0
 	for _, info := range s.cache {
+		if info.IsDatacenter || isDatacenterISP(info.ISP) {
+			continue
+		}
 		if strings.ToLower(strings.TrimSpace(info.CountryName)) == cNameLower || strings.ToLower(strings.TrimSpace(info.CountryCode)) == cNameLower {
 			isp := normalizeISPName(info.ISP)
-			if isp != "" && isp != "Broadband Provider" && isp != "Local Network" {
+			if isp != "" && isp != "Broadband Provider" && isp != "Local Network" && !isDatacenterISP(isp) {
 				counts[isp]++
 				totalKnownIPs++
 			}

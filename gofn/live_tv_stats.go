@@ -312,16 +312,22 @@ func (s *server) handleGetViewerCountries(w http.ResponseWriter, r *http.Request
 
 	for _, ip := range activeIPs {
 		geo := globalGeoIPService.Lookup(ip)
+		if geo.IsDatacenter || isDatacenterISP(geo.ISP) {
+			continue
+		}
 
 		cKey := fmt.Sprintf("%s:%s", geo.CountryCode, geo.CountryName)
 		countryCounts[cKey]++
 		countryCodeMap[cKey] = geo.CountryCode
 		countryNameMap[cKey] = geo.CountryName
 
-		iKey := fmt.Sprintf("%s:%s", geo.CountryCode, geo.ISP)
-		ispCounts[iKey]++
-		ispCodeMap[iKey] = geo.CountryCode
-		ispNameMap[iKey] = geo.ISP
+		ispName := normalizeISPName(geo.ISP)
+		if ispName != "" && !isDatacenterISP(ispName) {
+			iKey := fmt.Sprintf("%s:%s", geo.CountryCode, ispName)
+			ispCounts[iKey]++
+			ispCodeMap[iKey] = geo.CountryCode
+			ispNameMap[iKey] = ispName
+		}
 	}
 
 	var countries []countryItem
@@ -373,7 +379,7 @@ func (s *server) handleGetViewerCountries(w http.ResponseWriter, r *http.Request
 				SELECT country, isp, sum(distinct_sessions)::int as sessions
 				FROM public.viewer_daily
 				WHERE day >= (now() - interval '30 days')::date AND country <> 'Unknown' AND isp <> 'Unknown' AND isp <> ''
-				GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 20`)
+				GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 50`)
 			if errIsp == nil {
 				defer rowsIsp.Close()
 				for rowsIsp.Next() {
@@ -381,13 +387,17 @@ func (s *server) handleGetViewerCountries(w http.ResponseWriter, r *http.Request
 					var sess int
 					if err := rowsIsp.Scan(&cName, &ispName, &sess); err == nil {
 						code := getIsoCode(cName)
-						if ispName == "Cellular/Broadband" || ispName == "" {
+						normName := normalizeISPName(ispName)
+						if isDatacenterISP(normName) || isDatacenterISP(ispName) {
+							continue
+						}
+						if normName == "Cellular/Broadband" || normName == "" {
 							items := globalGeoIPService.GetCountryISPBreakdown(cName, sess)
 							isps = append(isps, items...)
 						} else {
 							isps = append(isps, ispItem{
 								Code:    code,
-								ISP:     ispName,
+								ISP:     normName,
 								Viewers: sess,
 							})
 						}
