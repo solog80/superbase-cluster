@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
@@ -148,6 +149,41 @@ func normalizeISPName(raw string) string {
 		return raw
 	}
 	return cleaned
+}
+
+func extractClientIP(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		parts := strings.Split(xff, ",")
+		if len(parts) > 0 {
+			ip := sanitizeIP(strings.TrimSpace(parts[0]))
+			if ip != "" && ip != "-" && !strings.HasPrefix(ip, "172.") && !strings.HasPrefix(ip, "10.") && !strings.HasPrefix(ip, "127.") {
+				return ip
+			}
+		}
+	}
+	if xri := r.Header.Get("X-Real-IP"); xri != "" {
+		ip := sanitizeIP(strings.TrimSpace(xri))
+		if ip != "" && ip != "-" && !strings.HasPrefix(ip, "172.") && !strings.HasPrefix(ip, "10.") && !strings.HasPrefix(ip, "127.") {
+			return ip
+		}
+	}
+	if r.RemoteAddr != "" {
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err == nil {
+			ip := sanitizeIP(strings.TrimSpace(host))
+			if ip != "" && ip != "-" && !strings.HasPrefix(ip, "172.") && !strings.HasPrefix(ip, "10.") && !strings.HasPrefix(ip, "127.") {
+				return ip
+			}
+		}
+		ip := sanitizeIP(strings.TrimSpace(r.RemoteAddr))
+		if ip != "" && ip != "-" && !strings.HasPrefix(ip, "172.") && !strings.HasPrefix(ip, "10.") && !strings.HasPrefix(ip, "127.") {
+			return ip
+		}
+	}
+	return ""
 }
 
 func sanitizeIP(ipStr string) string {

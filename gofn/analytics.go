@@ -44,9 +44,20 @@ func eventsTime(v any) time.Time {
 	return time.Now().UTC()
 }
 
-// collectCommon builds the shared device/geo/timestamp columns present in every
-// analytics event type.
-func collectCommon(ev map[string]any, now time.Time) map[string]any {
+func collectCommon(r *http.Request, ev map[string]any, now time.Time) map[string]any {
+	ip := extractClientIP(r)
+	if ip == "" {
+		if rawIP, ok := ev["client_ip"].(string); ok && rawIP != "" {
+			ip = sanitizeIP(rawIP)
+		} else if rawIP, ok := ev["user_id"].(string); ok && strings.Contains(rawIP, ".") {
+			ip = sanitizeIP(rawIP)
+		} else if rawIP, ok := ev["device_id"].(string); ok && strings.Contains(rawIP, ".") {
+			ip = sanitizeIP(rawIP)
+		}
+	}
+	if ip != "" && ip != "-" {
+		go globalGeoIPService.Lookup(ip)
+	}
 	return map[string]any{
 		"user_id":      ev["user_id"],
 		"profile_id":   ev["profile_id"],
@@ -151,7 +162,7 @@ func (s *server) ingestBatch(w http.ResponseWriter, r *http.Request, table strin
 	// Build the INSERT from the first row's keys (all rows share a shape).
 	rows := make([]map[string]any, 0, len(body.Events))
 	for _, ev := range body.Events {
-		rows = append(rows, build(ev, collectCommon(ev, now)))
+		rows = append(rows, build(ev, collectCommon(r, ev, now)))
 	}
 
 	cols := make([]string, 0, len(rows[0]))

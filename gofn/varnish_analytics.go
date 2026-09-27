@@ -145,6 +145,10 @@ func (vt *VarnishWindowTracker) RecordHit(ip, rawURI string) {
 	}
 	ip = strings.TrimSpace(ip)
 
+	if ip != "" && ip != "-" {
+		go globalGeoIPService.Lookup(ip)
+	}
+
 	// Identify stream name from request path
 	var stream string
 	if strings.Contains(rawURI, "/app/stream2/") {
