@@ -407,8 +407,8 @@ func (s *server) handleGetViewerCountries(w http.ResponseWriter, r *http.Request
 	if len(countries) > 20 {
 		countries = countries[:20]
 	}
-	if len(isps) > 20 {
-		isps = isps[:20]
+	if len(isps) > 100 {
+		isps = isps[:100]
 	}
 
 	if countries == nil {

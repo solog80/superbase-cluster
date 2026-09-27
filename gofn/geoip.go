@@ -45,6 +45,101 @@ func newGeoIPService() *GeoIPService {
 	return s
 }
 
+func normalizeISPName(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "-" {
+		return "Broadband Provider"
+	}
+
+	lower := strings.ToLower(raw)
+
+	if strings.Contains(lower, "airtel") || strings.Contains(lower, "mobile data service") {
+		return "Airtel"
+	}
+	if strings.Contains(lower, "mtn") {
+		return "MTN"
+	}
+	if strings.Contains(lower, "savanna") {
+		return "Savanna Fibre"
+	}
+	if strings.Contains(lower, "simba") {
+		return "Simba Fiber"
+	}
+	if strings.Contains(lower, "roke") {
+		return "ROKE Telkom"
+	}
+	if strings.Contains(lower, "liquid") {
+		return "Liquid Telecom"
+	}
+	if strings.Contains(lower, "uganda telecom") || strings.Contains(lower, "utl") {
+		return "Uganda Telecom (UTL)"
+	}
+	if strings.Contains(lower, "zuku") {
+		return "Zuku Fiber"
+	}
+	if strings.Contains(lower, "safaricom") {
+		return "Safaricom"
+	}
+	if strings.Contains(lower, "etisalat") || strings.Contains(lower, "e&") {
+		return "Etisalat (e&)"
+	}
+	if strings.Contains(lower, "emirates integrated") || lower == "du" {
+		return "du"
+	}
+	if strings.Contains(lower, "saudi telecom") || strings.Contains(lower, "stc") {
+		return "STC"
+	}
+	if strings.Contains(lower, "mobily") {
+		return "Mobily"
+	}
+	if strings.Contains(lower, "zain") {
+		return "Zain"
+	}
+	if strings.Contains(lower, "ooredoo") {
+		return "Ooredoo"
+	}
+	if strings.Contains(lower, "vodafone") {
+		return "Vodafone"
+	}
+	if strings.Contains(lower, "t-mobile") {
+		return "T-Mobile"
+	}
+	if strings.Contains(lower, "at&t") {
+		return "AT&T"
+	}
+	if strings.Contains(lower, "verizon") {
+		return "Verizon"
+	}
+	if strings.Contains(lower, "cloudflare") {
+		return "Cloudflare (CDN)"
+	}
+	if strings.Contains(lower, "microsoft") {
+		return "Microsoft Network"
+	}
+	if strings.Contains(lower, "google") {
+		return "Google Network"
+	}
+	if strings.Contains(lower, "amazon") || strings.Contains(lower, "aws") {
+		return "Amazon AWS"
+	}
+
+	cleaned := raw
+	for _, suffix := range []string{
+		" Limited", " Ltd", " LLC", " Inc.", " Inc", " Corp", " Corporation",
+		" Joint-Stock company", " Joint Stock Company", " PJSC", " JSC", " S.A.", " GmbH",
+		" Operations Limited", " Services, Inc", " Enterprises, LLC",
+	} {
+		if idx := strings.Index(strings.ToLower(cleaned), strings.ToLower(suffix)); idx != -1 {
+			cleaned = strings.TrimSpace(cleaned[:idx])
+		}
+	}
+
+	if cleaned == "" {
+		return raw
+	}
+	return cleaned
+}
+
 func (s *GeoIPService) loadTSV() {
 	paths := []string{
 		os.Getenv("GEO_TSV_PATH"),
@@ -76,7 +171,7 @@ func (s *GeoIPService) loadTSV() {
 				ip := strings.TrimSpace(parts[0])
 				cc := strings.TrimSpace(parts[1])
 				cname := strings.TrimSpace(parts[2])
-				isp := strings.TrimSpace(parts[3])
+				isp := normalizeISPName(parts[3])
 				if ip != "" && isp != "" {
 					s.cache[ip] = GeoInfo{
 						CountryCode: cc,
@@ -183,7 +278,7 @@ func (s *GeoIPService) Lookup(ipStr string) GeoInfo {
 					if cname == "" {
 						cname = apiResp.Country
 					}
-					isp = apiResp.ISP
+					isp = normalizeISPName(apiResp.ISP)
 					isDC = apiResp.Hosting
 				}
 			}
@@ -234,8 +329,8 @@ func (s *GeoIPService) GetCountryISPBreakdown(cName string, totalViewers int) []
 	totalKnownIPs := 0
 	for _, info := range s.cache {
 		if strings.ToLower(strings.TrimSpace(info.CountryName)) == cNameLower || strings.ToLower(strings.TrimSpace(info.CountryCode)) == cNameLower {
-			isp := strings.TrimSpace(info.ISP)
-			if isp != "" && isp != "Cellular/Broadband" && isp != "Local Network" {
+			isp := normalizeISPName(info.ISP)
+			if isp != "" && isp != "Broadband Provider" && isp != "Local Network" {
 				counts[isp]++
 				totalKnownIPs++
 			}
@@ -261,7 +356,7 @@ func (s *GeoIPService) GetCountryISPBreakdown(cName string, totalViewers int) []
 
 	var items []ispItem
 	allocated := 0
-	limit := 5
+	limit := 20
 	if len(sorted) < limit {
 		limit = len(sorted)
 	}
