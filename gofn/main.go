@@ -282,6 +282,8 @@ func (s *server) dispatch(w http.ResponseWriter, r *http.Request) {
 		s.handleGetViewerCountries(w, r)
 	case "getViewerPeak":
 		s.handleGetViewerPeak(w, r)
+	case "backfillGeoIP":
+		s.handleBackfillGeoIP(w, r)
 	case "syncViewerDaily":
 		s.handleSyncViewerDaily(w, r)
 	case "ingestVarnishLog":
@@ -426,6 +428,7 @@ func (s *server) publicFn(name string) bool {
 		"getViewerStats",
 		"getViewerCountries",
 		"getViewerPeak",
+		"backfillGeoIP",
 		"syncViewerDaily",
 		"ingestVarnishLog",
 		"getRadioHistory",

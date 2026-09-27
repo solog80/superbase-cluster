@@ -542,3 +542,47 @@ func (s *server) handleGetViewerPeak(w http.ResponseWriter, r *http.Request) {
 		"source":          "varnish_30s_window",
 	})
 }
+
+// handleBackfillGeoIP resolves unique viewer client IPs from active Varnish sessions and TSDB history via ip-api.com
+func (s *server) handleBackfillGeoIP(w http.ResponseWriter, r *http.Request) {
+	hours := atoiDefault(r.URL.Query().Get("hours"), 48)
+	if hours < 1 {
+		hours = 1
+	}
+	if hours > 168 {
+		hours = 168
+	}
+
+	activeIPs := globalVarnishTracker.GetActiveViewerIPs(time.Duration(hours) * time.Hour)
+
+	if s.tsdb != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+		if db, err := s.tsdbDB(ctx); err == nil {
+			rows, err := db.QueryContext(ctx, `
+				SELECT distinct coalesce(user_id, device_id)
+				FROM public.content_views
+				WHERE received_at > now() - ($1 * interval '1 hour')`, hours)
+			if err == nil {
+				defer rows.Close()
+				for rows.Next() {
+					var ip string
+					if err := rows.Scan(&ip); err == nil && len(ip) > 6 && strings.Contains(ip, ".") {
+						activeIPs = append(activeIPs, ip)
+					}
+				}
+			}
+		}
+	}
+
+	go func() {
+		count := globalGeoIPService.BackfillIPs(activeIPs)
+		log.Printf("[Backfill] Completed backfilling %d IPs for %d hours window", count, hours)
+	}()
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":           "backfill_started",
+		"unique_ips_found": len(activeIPs),
+		"window_hours":     hours,
+	})
+}

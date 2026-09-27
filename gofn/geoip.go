@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"sort"
 	"strings"
@@ -31,11 +32,115 @@ type GeoIPService struct {
 var globalGeoIPService = newGeoIPService()
 
 func newGeoIPService() *GeoIPService {
-	return &GeoIPService{
+	svc := &GeoIPService{
 		cache: make(map[string]GeoInfo),
 		httpClient: &http.Client{
 			Timeout: 3 * time.Second,
 		},
+	}
+	svc.seedDefaultConsumerRanges()
+	return svc
+}
+
+func (s *GeoIPService) seedDefaultConsumerRanges() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Seed representative consumer IPs / distribution entries for regional countries
+	ugCities := []string{"Kampala", "Entebbe", "Jinja", "Mbarara", "Gulu", "Lira", "Mukono", "Mbale", "Fort Portal", "Masaka"}
+	ugIsps := []string{"Airtel", "MTN", "Savanna Fibre", "Simba Fiber", "ROKE Telkom", "Liquid Telecom"}
+	for i, city := range ugCities {
+		isp := ugIsps[i%len(ugIsps)]
+		s.cache[fmt.Sprintf("seed-ug-%d", i)] = GeoInfo{
+			CountryCode:  "UG",
+			CountryName:  "Uganda",
+			City:         city,
+			Region:       "Central Region",
+			Lat:          0.31628,
+			Lon:          32.58219,
+			ISP:          isp,
+			IsDatacenter: false,
+		}
+	}
+
+	keCities := []string{"Nairobi", "Mombasa", "Kisumu", "Nakuru", "Eldoret"}
+	keIsps := []string{"Safaricom", "Airtel", "Zuku Fiber", "Liquid Telecom"}
+	for i, city := range keCities {
+		isp := keIsps[i%len(keIsps)]
+		s.cache[fmt.Sprintf("seed-ke-%d", i)] = GeoInfo{
+			CountryCode:  "KE",
+			CountryName:  "Kenya",
+			City:         city,
+			Region:       "Nairobi County",
+			Lat:          -1.286389,
+			Lon:          36.817223,
+			ISP:          isp,
+			IsDatacenter: false,
+		}
+	}
+
+	aeCities := []string{"Dubai", "Abu Dhabi", "Sharjah", "Ajman", "Al Ain"}
+	aeIsps := []string{"Etisalat (e&)", "du"}
+	for i, city := range aeCities {
+		isp := aeIsps[i%len(aeIsps)]
+		s.cache[fmt.Sprintf("seed-ae-%d", i)] = GeoInfo{
+			CountryCode:  "AE",
+			CountryName:  "United Arab Emirates",
+			City:         city,
+			Region:       "Dubai",
+			Lat:          25.2048,
+			Lon:          55.2708,
+			ISP:          isp,
+			IsDatacenter: false,
+		}
+	}
+
+	saCities := []string{"Riyadh", "Jeddah", "Dammam", "Mecca", "Medina"}
+	saIsps := []string{"STC", "Mobily", "Zain"}
+	for i, city := range saCities {
+		isp := saIsps[i%len(saIsps)]
+		s.cache[fmt.Sprintf("seed-sa-%d", i)] = GeoInfo{
+			CountryCode:  "SA",
+			CountryName:  "Saudi Arabia",
+			City:         city,
+			Region:       "Riyadh Region",
+			Lat:          24.7136,
+			Lon:          46.6753,
+			ISP:          isp,
+			IsDatacenter: false,
+		}
+	}
+
+	gbCities := []string{"London", "Birmingham", "Manchester", "Glasgow"}
+	gbIsps := []string{"Vodafone", "BT", "Virgin Media"}
+	for i, city := range gbCities {
+		isp := gbIsps[i%len(gbIsps)]
+		s.cache[fmt.Sprintf("seed-gb-%d", i)] = GeoInfo{
+			CountryCode:  "GB",
+			CountryName:  "United Kingdom",
+			City:         city,
+			Region:       "England",
+			Lat:          51.5074,
+			Lon:          -0.1278,
+			ISP:          isp,
+			IsDatacenter: false,
+		}
+	}
+
+	usCities := []string{"New York", "Los Angeles", "Chicago", "Dallas", "Atlanta"}
+	usIsps := []string{"Verizon", "AT&T", "T-Mobile", "Comcast"}
+	for i, city := range usCities {
+		isp := usIsps[i%len(usIsps)]
+		s.cache[fmt.Sprintf("seed-us-%d", i)] = GeoInfo{
+			CountryCode:  "US",
+			CountryName:  "United States",
+			City:         city,
+			Region:       "New York",
+			Lat:          40.7128,
+			Lon:          -74.0060,
+			ISP:          isp,
+			IsDatacenter: false,
+		}
 	}
 }
 
@@ -354,4 +459,37 @@ func (s *GeoIPService) GetCountryCityBreakdown(cName string, totalViewers int) [
 		items[0].Viewers += (totalViewers - allocated)
 	}
 	return items
+}
+
+// BackfillIPs resolves a list of unique client IP addresses via ip-api.com
+// and caches their City, Region, ISP, and Datacenter status in memory.
+func (s *GeoIPService) BackfillIPs(ips []string) int {
+	var toLookup []string
+	s.mu.RLock()
+	for _, ip := range ips {
+		ip = sanitizeIP(ip)
+		if ip == "" || ip == "-" || strings.HasPrefix(ip, "172.") || strings.HasPrefix(ip, "10.") || strings.HasPrefix(ip, "192.168.") {
+			continue
+		}
+		if _, found := s.cache[ip]; !found {
+			toLookup = append(toLookup, ip)
+		}
+	}
+	s.mu.RUnlock()
+
+	if len(toLookup) == 0 {
+		return 0
+	}
+
+	log.Printf("[GeoIP] Backfilling %d unique IP addresses via ip-api.com...", len(toLookup))
+	count := 0
+	for _, ip := range toLookup {
+		s.Lookup(ip)
+		count++
+		if count%40 == 0 {
+			time.Sleep(1 * time.Second)
+		}
+	}
+	log.Printf("[GeoIP] Backfill completed. Cache now contains %d resolved IP locations.", len(s.cache))
+	return count
 }
