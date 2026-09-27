@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -38,8 +39,60 @@ func newGeoIPService() *GeoIPService {
 			Timeout: 2 * time.Second,
 		},
 	}
+	s.loadTSV()
 	s.initMMDB()
 	return s
+}
+
+func (s *GeoIPService) loadTSV() {
+	paths := []string{
+		os.Getenv("GEO_TSV_PATH"),
+		"/cache/geo.tsv",
+		"/home/customer/vstats/cache/geo.tsv",
+		"/home/customer/shipper/state/geo.tsv",
+		"/data/geo.tsv",
+		"./geo.tsv",
+	}
+
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+		f, err := os.Open(p)
+		if err != nil {
+			continue
+		}
+		scanner := bufio.NewScanner(f)
+		count := 0
+		s.mu.Lock()
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" {
+				continue
+			}
+			parts := strings.Split(line, "\t")
+			if len(parts) >= 4 {
+				ip := strings.TrimSpace(parts[0])
+				cc := strings.TrimSpace(parts[1])
+				cname := strings.TrimSpace(parts[2])
+				isp := strings.TrimSpace(parts[3])
+				if ip != "" && isp != "" {
+					s.cache[ip] = GeoInfo{
+						CountryCode: cc,
+						CountryName: cname,
+						ISP:         isp,
+					}
+					count++
+				}
+			}
+		}
+		s.mu.Unlock()
+		_ = f.Close()
+		if count > 0 {
+			log.Printf("[GeoIP] Loaded %d IP mappings from TSV: %s", count, p)
+			break
+		}
+	}
 }
 
 func (s *GeoIPService) initMMDB() {
@@ -142,8 +195,8 @@ func (s *GeoIPService) Lookup(ipStr string) GeoInfo {
 	if cname == "" {
 		cname = "Uganda"
 	}
-	if isp == "" {
-		isp = "Cellular/Broadband"
+	if isp == "" || isp == "Cellular/Broadband" {
+		isp = getCountryDefaultProvider(cname)
 	}
 
 	dcKeywords := []string{"hetzner", "digitalocean", "vultr", "linode", "contabo", "ovh", "scaleway", "upcloud", "amazon", "amazonaws", "azure", "google", "cloudflare", "fastly", "akamai", "hosting", "datacenter", "vps"}
@@ -167,4 +220,27 @@ func (s *GeoIPService) Lookup(ipStr string) GeoInfo {
 	s.mu.Unlock()
 
 	return info
+}
+
+func getCountryDefaultProvider(cName string) string {
+	switch strings.ToLower(strings.TrimSpace(cName)) {
+	case "uganda":
+		return "MTN / Airtel Broadband"
+	case "saudi arabia":
+		return "STC / Mobily Broadband"
+	case "united arab emirates":
+		return "e& / du Broadband"
+	case "united states":
+		return "AT&T / Verizon Broadband"
+	case "china":
+		return "China Mobile / Telecom"
+	case "qatar":
+		return "Ooredoo / Vodafone Broadband"
+	case "united kingdom":
+		return "BT / EE Broadband"
+	case "kenya":
+		return "Safaricom / Airtel Broadband"
+	default:
+		return "Broadband Provider"
+	}
 }

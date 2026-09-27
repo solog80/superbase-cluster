@@ -371,6 +371,9 @@ func (s *server) handleGetViewerCountries(w http.ResponseWriter, r *http.Request
 					var sess int
 					if err := rowsIsp.Scan(&cName, &ispName, &sess); err == nil {
 						code := getIsoCode(cName)
+						if ispName == "Cellular/Broadband" || ispName == "" {
+							ispName = getCountryDefaultProvider(cName)
+						}
 						isps = append(isps, ispItem{
 							Code:    code,
 							ISP:     ispName,
