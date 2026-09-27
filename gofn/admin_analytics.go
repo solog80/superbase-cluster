@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -34,41 +35,68 @@ func (s *server) handleGetAdminAnalytics(w http.ResponseWriter, r *http.Request)
 	ctx, cancel := context.WithTimeout(r.Context(), 40*time.Second)
 	defer cancel()
 
-	// 1. App analytics (TV/VOD/...): cached get_analytics_metrics() RPC.
-	payload, err := s.radioRPCPayload(ctx, "get_analytics_metrics", nil, nil, metricsCacheTTL)
-	if err != nil {
-		if errors.Is(err, errTsdbUnavailable) {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": err.Error()})
+	metricsArgs := map[string]any{"p_days": days, "p_start": pStart, "p_end": pEnd}
+	radioArgs := map[string]any{"p_days": days, "p_start": pStart, "p_end": pEnd}
+	snapArgs := map[string]any{"p_start": pStart, "p_end": pEnd}
+
+	var (
+		wg         sync.WaitGroup
+		appPayload []byte
+		appErr     error
+		radioData  map[string]any
+		showsData  map[string]any
+		snapData   map[string]any
+		nowPlaying map[string]any
+		hasNowPlay bool
+	)
+
+	// Fan out all 5 sub-queries in parallel
+	wg.Add(5)
+	go func() {
+		defer wg.Done()
+		appPayload, appErr = s.radioRPCPayload(ctx, "get_analytics_metrics", []string{"p_days", "p_start", "p_end"}, metricsArgs, metricsCacheTTL)
+	}()
+	go func() {
+		defer wg.Done()
+		radioData = s.radioPayloadFor(ctx, "get_radio_reports", []string{"p_days", "p_start", "p_end"}, radioArgs)
+	}()
+	go func() {
+		defer wg.Done()
+		showsData = s.radioPayloadFor(ctx, "get_radio_show_analytics", []string{"p_days", "p_start", "p_end"}, radioArgs)
+	}()
+	go func() {
+		defer wg.Done()
+		snapData = s.radioPayloadFor(ctx, "get_radio_show_snapshots", []string{"p_start", "p_end"}, snapArgs)
+	}()
+	go func() {
+		defer wg.Done()
+		nowPlaying, hasNowPlay = s.fetchLiveNowPlaying(ctx)
+	}()
+	wg.Wait()
+
+	if appErr != nil {
+		if errors.Is(appErr, errTsdbUnavailable) {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": appErr.Error()})
 		} else {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "analytics: " + err.Error()})
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "analytics: " + appErr.Error()})
 		}
 		return
 	}
+
 	merged := map[string]any{}
-	if err := json.Unmarshal(payload, &merged); err != nil {
+	if err := json.Unmarshal(appPayload, &merged); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "bad analytics payload: " + err.Error()})
 		return
 	}
 	merged["days"] = days
 
-	// 2. Radio data — best-effort (mirrors Promise.allSettled): any radio RPC
-	// failure keeps the app analytics and just omits radio fields.
-	radioArgs := map[string]any{"p_days": days, "p_start": pStart, "p_end": pEnd}
-	radioData := s.radioPayloadFor(ctx, "get_radio_reports", []string{"p_days", "p_start", "p_end"}, radioArgs)
-	showsData := s.radioPayloadFor(ctx, "get_radio_show_analytics", []string{"p_days", "p_start", "p_end"}, radioArgs)
-	snapData := s.radioPayloadFor(ctx, "get_radio_show_snapshots", []string{"p_start", "p_end"}, map[string]any{"p_start": pStart, "p_end": pEnd})
-
-	// Live nowplaying from AzuraCast for the "Now Playing" card.
-	if radioData != nil {
-		if cur, ok := s.fetchLiveNowPlaying(ctx); ok {
-			radioData["current"] = cur
-		}
+	if radioData != nil && hasNowPlay {
+		radioData["current"] = nowPlaying
 	}
 
 	s.mergeRadioAnalytics(merged, radioData, showsData, snapData)
 
-	// Enrich on-demand rows with episode thumbnails (VOD content has no EPG
-	// metadata, so the analytics RPC can't resolve a thumbnail for it).
+	// Enrich on-demand rows with episode thumbnails
 	s.enrichOndemandThumbnails(ctx, merged)
 
 	merged["radioSource"] = "azuraCast"

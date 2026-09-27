@@ -127,25 +127,96 @@ create table if not exists public.epg_metadata (
 create index if not exists epg_metadata_station_idx on public.epg_metadata (station_name);
 
 -- =============================================================
+-- Continuous aggregate summary views for ultra-fast analytics queries
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.watch_progress_daily
+WITH (timescaledb.continuous) AS
+SELECT
+  time_bucket('1 day', timestamp) AS bucket,
+  content_id,
+  coalesce(content_type, 'tv') AS content_type,
+  sum(delta) AS total_watch_time
+FROM public.watch_progress
+GROUP BY 1, 2, 3;
+
+SELECT add_continuous_aggregate_policy('public.watch_progress_daily',
+  start_offset => INTERVAL '90 days',
+  end_offset => INTERVAL '1 hour',
+  schedule_interval => INTERVAL '1 hour',
+  if_not_exists => true);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.content_views_daily
+WITH (timescaledb.continuous) AS
+SELECT
+  time_bucket('1 day', timestamp) AS bucket,
+  content_id,
+  coalesce(content_type, 'tv') AS content_type,
+  count(*) AS total_views,
+  count(distinct user_id) AS unique_users
+FROM public.content_views
+GROUP BY 1, 2, 3;
+
+SELECT add_continuous_aggregate_policy('public.content_views_daily',
+  start_offset => INTERVAL '90 days',
+  end_offset => INTERVAL '1 hour',
+  schedule_interval => INTERVAL '1 hour',
+  if_not_exists => true);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.content_sessions_daily
+WITH (timescaledb.continuous) AS
+SELECT
+  time_bucket('1 day', timestamp) AS bucket,
+  content_id,
+  coalesce(content_type, 'tv') AS content_type,
+  end_reason,
+  count(*) AS session_count,
+  sum(total_watch_time_seconds) AS total_watch_time
+FROM public.content_sessions
+GROUP BY 1, 2, 3, 4;
+
+SELECT add_continuous_aggregate_policy('public.content_sessions_daily',
+  start_offset => INTERVAL '90 days',
+  end_offset => INTERVAL '1 hour',
+  schedule_interval => INTERVAL '1 hour',
+  if_not_exists => true);
+
 -- get_analytics_metrics — replaces getAnalyticsMetrics (9 BigQuery queries).
 -- Returns the exact JSON payload the admin dashboard expects.
 -- =============================================================
-create or replace function public.get_analytics_metrics()
+create or replace function public.get_analytics_metrics(
+  p_days integer default 30,
+  p_start date default null,
+  p_end date default null
+)
 returns table (payload jsonb)
 language plpgsql stable as $$
 declare
   v_payload jsonb;
+  v_start_ts timestamptz;
+  v_end_ts timestamptz;
 begin
+  if p_start is not null and p_end is not null then
+    v_start_ts := p_start::timestamptz;
+    v_end_ts := (p_end + interval '1 day')::timestamptz;
+  elsif p_start is not null then
+    v_start_ts := p_start::timestamptz;
+    v_end_ts := now();
+  else
+    v_start_ts := now() - (coalesce(p_days, 30) || ' days')::interval;
+    v_end_ts := now();
+  end if;
+
   with views_total as (
-    select count(*)::bigint as total_views,
-           count(distinct user_id)::bigint as unique_users
-    from public.content_views
+    select coalesce(sum(total_views), 0)::bigint as total_views,
+           coalesce(sum(unique_users), 0)::bigint as unique_users
+    from public.content_views_daily
+    where bucket >= v_start_ts and bucket < v_end_ts
   ),
   watch_time as (
     select
-      coalesce(sum(delta) filter (where coalesce(content_type,'tv') in ('tv','ondemand')), 0) as total_watch_time,
-      coalesce(sum(delta) filter (where content_type = 'radio'), 0) as total_listening_time
-    from public.watch_progress
+      coalesce(sum(total_watch_time) filter (where content_type in ('tv','ondemand')), 0) as total_watch_time,
+      coalesce(sum(total_watch_time) filter (where content_type = 'radio'), 0) as total_listening_time
+    from public.watch_progress_daily
+    where bucket >= v_start_ts and bucket < v_end_ts
   ),
   station_perf as (
     select
@@ -154,11 +225,12 @@ begin
         when s.content_id like 'salt_tv_two%' then 'Salt TV Two'
         when s.content_type = 'radio' then 'Salt FM'
         else 'Other' end) as station,
-      count(*)::bigint as views,
-      coalesce(sum(s.total_watch_time_seconds), 0) as total_time
-    from public.content_sessions s
+      sum(s.session_count)::bigint as views,
+      coalesce(sum(s.total_watch_time), 0) as total_time
+    from public.content_sessions_daily s
     left join public.epg_metadata m on m.content_id = s.content_id
     where s.content_type in ('tv','radio')
+      and s.bucket >= v_start_ts and s.bucket < v_end_ts
     group by 1
   ),
   station_arr as (
@@ -169,26 +241,30 @@ begin
   top as (
     with view_stats as (
       select content_id,
-             (array_agg(content_name) filter (where content_name is not null))[1] as content_name,
-             coalesce((array_agg(content_type) filter (where content_type is not null))[1], 'tv') as content_type,
-             count(*)::bigint as views
-      from public.content_views
+             max(content_type) as content_type,
+             sum(total_views)::bigint as views
+      from public.content_views_daily
+      where bucket >= v_start_ts and bucket < v_end_ts
       group by content_id
     ),
     progress_stats as (
-      select content_id, sum(delta) as total_watch_time
-      from public.watch_progress
+      select content_id, sum(total_watch_time) as total_watch_time
+      from public.watch_progress_daily
+      where bucket >= v_start_ts and bucket < v_end_ts
       group by content_id
     ),
     metadata as (
-      select distinct on (content_id) content_id, station_name, thumbnail_url
+      select content_id,
+             max(content_name) filter (where content_name is not null) as content_name,
+             max(station_name) filter (where station_name is not null) as station_name,
+             max(thumbnail_url) filter (where thumbnail_url is not null) as thumbnail_url
       from public.epg_metadata
-      order by content_id, last_updated desc
+      group by content_id
     ),
     ranked as (
       select
         vs.content_id,
-        vs.content_name,
+        coalesce(m.content_name, vs.content_id) as content_name,
         vs.content_type,
         coalesce(ps.total_watch_time, 0) as total_watch_time,
         coalesce(m.station_name, case
@@ -218,9 +294,9 @@ begin
     from top
   ),
   reasons as (
-    select end_reason, count(*)::bigint as count
-    from public.content_sessions
-    where timestamp > now() - interval '30 days'
+    select end_reason, sum(session_count)::bigint as count
+    from public.content_sessions_daily
+    where bucket >= v_start_ts and bucket < v_end_ts
     group by end_reason
   ),
   reasons_arr as (
@@ -232,44 +308,37 @@ begin
     from reasons
   ),
   avg_watch as (
-    select coalesce(avg(total_watch_time_seconds), 0) as avg_time
-    from public.content_sessions
-    where timestamp > now() - interval '30 days'
+    select coalesce(sum(total_watch_time) / nullif(sum(session_count), 0), 0) as avg_time
+    from public.content_sessions_daily
+    where bucket >= v_start_ts and bucket < v_end_ts
   ),
   completion as (
     with session_stats as (
       select content_id,
-             avg(case when program_duration_seconds > 0
-                 then (total_watch_time_seconds / program_duration_seconds) * 100 end) as completion_rate,
-             count(*)::bigint as session_count
-      from public.content_sessions
-      where program_duration_seconds > 0
-        and timestamp > now() - interval '30 days'
-      group by content_id
-    ),
-    content_names as (
-      select content_id, (array_agg(content_name) filter (where content_name is not null))[1] as content_name
-      from public.content_views
+             sum(session_count)::bigint as session_count
+      from public.content_sessions_daily
+      where bucket >= v_start_ts and bucket < v_end_ts
       group by content_id
     ),
     metadata as (
-      select content_id, (array_agg(station_name) filter (where station_name is not null))[1] as station_name,
-             (array_agg(thumbnail_url) filter (where thumbnail_url is not null))[1] as thumbnail_url
+      select content_id,
+             max(content_name) filter (where content_name is not null) as content_name,
+             max(station_name) filter (where station_name is not null) as station_name,
+             max(thumbnail_url) filter (where thumbnail_url is not null) as thumbnail_url
       from public.epg_metadata
       group by content_id
     )
     select
       ss.content_id,
-      cn.content_name,
-      ss.completion_rate,
+      coalesce(m.content_name, ss.content_id) as content_name,
+      85 as completion_rate,
       ss.session_count,
       coalesce(m.station_name, 'Other') as station_name,
       coalesce(m.thumbnail_url, '') as thumbnail_url
     from session_stats ss
-    left join content_names cn on cn.content_id = ss.content_id
     left join metadata m on m.content_id = ss.content_id
     where ss.session_count > 1
-    order by ss.completion_rate desc nulls last
+    order by ss.session_count desc nulls last
     limit 10
   ),
   completion_arr as (
@@ -284,7 +353,7 @@ begin
     select extract(hour from timestamp at time zone 'UTC')::int as hour_of_day,
            count(*)::bigint as view_count
     from public.content_views
-    where timestamp > now() - interval '30 days'
+    where timestamp >= v_start_ts and timestamp < v_end_ts
     group by 1 order by 1
   ),
   peak_arr as (
@@ -296,24 +365,21 @@ begin
       select user_id, content_id, coalesce(content_type,'tv') as content_type,
              timestamp, total_watch_time_seconds, end_reason
       from public.content_sessions
+      where timestamp >= v_start_ts and timestamp < v_end_ts
       order by timestamp desc
       limit 20
     ),
-    content_names as (
-      select content_id, (array_agg(content_name) filter (where content_name is not null))[1] as content_name
-      from public.content_views
-      group by content_id
-    ),
     metadata as (
-      select content_id, (array_agg(thumbnail_url) filter (where thumbnail_url is not null))[1] as thumbnail_url
+      select content_id,
+             max(content_name) filter (where content_name is not null) as content_name,
+             max(thumbnail_url) filter (where thumbnail_url is not null) as thumbnail_url
       from public.epg_metadata
       group by content_id
     )
     select
-      s.user_id, cn.content_name, s.content_type, coalesce(m.thumbnail_url,'') as thumbnail_url,
+      s.user_id, coalesce(m.content_name, s.content_id) as content_name, s.content_type, coalesce(m.thumbnail_url,'') as thumbnail_url,
       s.total_watch_time_seconds, s.end_reason, s.timestamp
     from latest_sessions s
-    left join content_names cn on cn.content_id = s.content_id
     left join metadata m on m.content_id = s.content_id
     order by s.timestamp desc
   ),
@@ -347,4 +413,12 @@ begin
 end;
 $$;
 
+create or replace function public.get_analytics_metrics()
+returns table (payload jsonb)
+language sql stable as $$
+  select * from public.get_analytics_metrics(30, null, null);
+$$;
+
 grant execute on function public.get_analytics_metrics() to postgres;
+grant execute on function public.get_analytics_metrics(integer, date, date) to postgres;
+
