@@ -1,20 +1,14 @@
 package main
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
-	"net"
 	"net/http"
-	"os"
 	"sort"
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/oschwald/geoip2-golang"
 )
 
 type GeoInfo struct {
@@ -31,22 +25,18 @@ type GeoInfo struct {
 type GeoIPService struct {
 	mu         sync.RWMutex
 	cache      map[string]GeoInfo
-	db         *geoip2.Reader
 	httpClient *http.Client
 }
 
 var globalGeoIPService = newGeoIPService()
 
 func newGeoIPService() *GeoIPService {
-	s := &GeoIPService{
+	return &GeoIPService{
 		cache: make(map[string]GeoInfo),
 		httpClient: &http.Client{
-			Timeout: 2 * time.Second,
+			Timeout: 3 * time.Second,
 		},
 	}
-	s.loadTSV()
-	s.initMMDB()
-	return s
 }
 
 func normalizeISPName(raw string) string {
@@ -144,83 +134,6 @@ func normalizeISPName(raw string) string {
 	return cleaned
 }
 
-func (s *GeoIPService) loadTSV() {
-	paths := []string{
-		os.Getenv("GEO_TSV_PATH"),
-		"/cache/geo.tsv",
-		"/home/customer/vstats/cache/geo.tsv",
-		"/home/customer/shipper/state/geo.tsv",
-		"/data/geo.tsv",
-		"./geo.tsv",
-	}
-
-	for _, p := range paths {
-		if p == "" {
-			continue
-		}
-		f, err := os.Open(p)
-		if err != nil {
-			continue
-		}
-		scanner := bufio.NewScanner(f)
-		count := 0
-		s.mu.Lock()
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line == "" {
-				continue
-			}
-			parts := strings.Split(line, "\t")
-			if len(parts) >= 4 {
-				ip := strings.TrimSpace(parts[0])
-				cc := strings.TrimSpace(parts[1])
-				cname := strings.TrimSpace(parts[2])
-				isp := normalizeISPName(parts[3])
-				if ip != "" && isp != "" {
-					s.cache[ip] = GeoInfo{
-						CountryCode: cc,
-						CountryName: cname,
-						ISP:         isp,
-					}
-					count++
-				}
-			}
-		}
-		s.mu.Unlock()
-		_ = f.Close()
-		if count > 0 {
-			log.Printf("[GeoIP] Loaded %d IP mappings from TSV: %s", count, p)
-			break
-		}
-	}
-}
-
-func (s *GeoIPService) initMMDB() {
-	paths := []string{
-		os.Getenv("GEOIP_DB_PATH"),
-		"/data/GeoLite2-City.mmdb",
-		"/home/customer/owncast/data/GeoLite2-City.mmdb",
-		"/var/lib/GeoIP/GeoLite2-City.mmdb",
-		"/usr/share/GeoIP/GeoLite2-City.mmdb",
-		"./GeoLite2-City.mmdb",
-	}
-
-	for _, p := range paths {
-		if p == "" {
-			continue
-		}
-		if _, err := os.Stat(p); err == nil {
-			db, err := geoip2.Open(p)
-			if err == nil {
-				s.db = db
-				log.Printf("[GeoIP] Successfully loaded MaxMind database from %s", p)
-				return
-			}
-		}
-	}
-	log.Printf("[GeoIP] No local MaxMind database found, using HTTP GeoIP fallback")
-}
-
 func sanitizeIP(ipStr string) string {
 	ipStr = strings.TrimSpace(ipStr)
 	if idx := strings.Index(ipStr, ":"); idx != -1 && !strings.Contains(ipStr, "]") && strings.Count(ipStr, ":") == 1 {
@@ -251,22 +164,10 @@ func (s *GeoIPService) Lookup(ipStr string) GeoInfo {
 		return info
 	}
 
-	var cc, cname, city, region string
+	var cc, cname, city, region, isp string
 	var lat, lon float64
+	var isDC bool
 
-	if s.db != nil {
-		parsedIP := net.ParseIP(ipStr)
-		if parsedIP != nil {
-			if record, err := s.db.City(parsedIP); err == nil {
-				cc = record.Country.IsoCode
-				cname = record.Country.Names["en"]
-				city = record.City.Names["en"]
-			}
-		}
-	}
-
-	isp := ""
-	isDC := false
 	apiURL := fmt.Sprintf("http://ip-api.com/json/%s?fields=status,countryCode,country,regionName,city,lat,lon,isp,hosting", ipStr)
 	req, err := http.NewRequest(http.MethodGet, apiURL, nil)
 	if err == nil {
@@ -287,24 +188,12 @@ func (s *GeoIPService) Lookup(ipStr string) GeoInfo {
 					Hosting     bool    `json:"hosting"`
 				}
 				if err := json.Unmarshal(body, &apiResp); err == nil && apiResp.Status == "success" {
-					if cc == "" {
-						cc = apiResp.CountryCode
-					}
-					if cname == "" {
-						cname = apiResp.Country
-					}
-					if city == "" {
-						city = apiResp.City
-					}
-					if region == "" {
-						region = apiResp.RegionName
-					}
-					if lat == 0 {
-						lat = apiResp.Lat
-					}
-					if lon == 0 {
-						lon = apiResp.Lon
-					}
+					cc = apiResp.CountryCode
+					cname = apiResp.Country
+					city = apiResp.City
+					region = apiResp.RegionName
+					lat = apiResp.Lat
+					lon = apiResp.Lon
 					isp = normalizeISPName(apiResp.ISP)
 					isDC = apiResp.Hosting
 				}
@@ -321,6 +210,10 @@ func (s *GeoIPService) Lookup(ipStr string) GeoInfo {
 	if city == "" {
 		city = "Kampala"
 	}
+	if isp == "" {
+		isp = "Broadband Provider"
+	}
+
 	info = GeoInfo{
 		CountryCode:  cc,
 		CountryName:  cname,
@@ -340,7 +233,7 @@ func (s *GeoIPService) Lookup(ipStr string) GeoInfo {
 }
 
 // GetCountryISPBreakdown dynamically aggregates real ISP frequencies for a given country
-// from the loaded 37k+ GeoIP TSV cache and scales them to totalViewers.
+// from the loaded GeoIP cache and scales them to totalViewers.
 func (s *GeoIPService) GetCountryISPBreakdown(cName string, totalViewers int) []ispItem {
 	code := getIsoCode(cName)
 	cNameLower := strings.ToLower(strings.TrimSpace(cName))
