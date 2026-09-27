@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -195,8 +196,8 @@ func (s *GeoIPService) Lookup(ipStr string) GeoInfo {
 	if cname == "" {
 		cname = "Uganda"
 	}
-	if isp == "" || isp == "Cellular/Broadband" {
-		isp = getCountryDefaultProvider(cname)
+	if isp == "" {
+		isp = "Broadband Provider"
 	}
 
 	dcKeywords := []string{"hetzner", "digitalocean", "vultr", "linode", "contabo", "ovh", "scaleway", "upcloud", "amazon", "amazonaws", "azure", "google", "cloudflare", "fastly", "akamai", "hosting", "datacenter", "vps"}
@@ -222,25 +223,62 @@ func (s *GeoIPService) Lookup(ipStr string) GeoInfo {
 	return info
 }
 
-func getCountryDefaultProvider(cName string) string {
-	switch strings.ToLower(strings.TrimSpace(cName)) {
-	case "uganda":
-		return "MTN / Airtel Broadband"
-	case "saudi arabia":
-		return "STC / Mobily Broadband"
-	case "united arab emirates":
-		return "e& / du Broadband"
-	case "united states":
-		return "AT&T / Verizon Broadband"
-	case "china":
-		return "China Mobile / Telecom"
-	case "qatar":
-		return "Ooredoo / Vodafone Broadband"
-	case "united kingdom":
-		return "BT / EE Broadband"
-	case "kenya":
-		return "Safaricom / Airtel Broadband"
-	default:
-		return "Broadband Provider"
+// GetCountryISPBreakdown dynamically aggregates real ISP frequencies for a given country
+// from the loaded 37k+ GeoIP TSV cache and scales them to totalViewers.
+func (s *GeoIPService) GetCountryISPBreakdown(cName string, totalViewers int) []ispItem {
+	code := getIsoCode(cName)
+	cNameLower := strings.ToLower(strings.TrimSpace(cName))
+
+	s.mu.RLock()
+	counts := make(map[string]int)
+	totalKnownIPs := 0
+	for _, info := range s.cache {
+		if strings.ToLower(strings.TrimSpace(info.CountryName)) == cNameLower || strings.ToLower(strings.TrimSpace(info.CountryCode)) == cNameLower {
+			isp := strings.TrimSpace(info.ISP)
+			if isp != "" && isp != "Cellular/Broadband" && isp != "Local Network" {
+				counts[isp]++
+				totalKnownIPs++
+			}
+		}
 	}
+	s.mu.RUnlock()
+
+	if totalKnownIPs == 0 || len(counts) == 0 {
+		return []ispItem{{Code: code, ISP: "Broadband Provider", Viewers: totalViewers}}
+	}
+
+	type kv struct {
+		isp   string
+		count int
+	}
+	var sorted []kv
+	for k, v := range counts {
+		sorted = append(sorted, kv{isp: k, count: v})
+	}
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].count > sorted[j].count
+	})
+
+	var items []ispItem
+	allocated := 0
+	limit := 5
+	if len(sorted) < limit {
+		limit = len(sorted)
+	}
+	for i := 0; i < limit; i++ {
+		v := int(float64(sorted[i].count) / float64(totalKnownIPs) * float64(totalViewers))
+		if v < 1 {
+			v = 1
+		}
+		allocated += v
+		items = append(items, ispItem{
+			Code:    code,
+			ISP:     sorted[i].isp,
+			Viewers: v,
+		})
+	}
+	if len(items) > 0 && allocated < totalViewers {
+		items[0].Viewers += (totalViewers - allocated)
+	}
+	return items
 }

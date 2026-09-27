@@ -160,6 +160,14 @@ func (s *server) handleGetLiveTvStats(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	sumStreams := 0
+	for _, cnt := range stMap {
+		sumStreams += cnt
+	}
+	if sumStreams > viewers {
+		viewers = sumStreams
+	}
+
 	resp := map[string]any{
 		"viewers":            viewers,
 		"total_connections":  viewers,
@@ -270,6 +278,18 @@ func (s *server) handleGetViewerStats(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+type countryItem struct {
+	Code    string `json:"code"`
+	Country string `json:"country"`
+	Viewers int    `json:"viewers"`
+}
+
+type ispItem struct {
+	Code    string `json:"code"`
+	ISP     string `json:"isp"`
+	Viewers int    `json:"viewers"`
+}
+
 // handleGetViewerCountries queries viewer country and ISP breakdowns dynamically from active Varnish sessions or TSDB GeoIP.
 func (s *server) handleGetViewerCountries(w http.ResponseWriter, r *http.Request) {
 	minutes := atoiDefault(r.URL.Query().Get("minutes"), 60)
@@ -304,11 +324,6 @@ func (s *server) handleGetViewerCountries(w http.ResponseWriter, r *http.Request
 		ispNameMap[iKey] = geo.ISP
 	}
 
-	type countryItem struct {
-		Code    string `json:"code"`
-		Country string `json:"country"`
-		Viewers int    `json:"viewers"`
-	}
 	var countries []countryItem
 	for k, count := range countryCounts {
 		countries = append(countries, countryItem{
@@ -318,11 +333,6 @@ func (s *server) handleGetViewerCountries(w http.ResponseWriter, r *http.Request
 		})
 	}
 
-	type ispItem struct {
-		Code    string `json:"code"`
-		ISP     string `json:"isp"`
-		Viewers int    `json:"viewers"`
-	}
 	var isps []ispItem
 	for k, count := range ispCounts {
 		isps = append(isps, ispItem{
@@ -372,13 +382,15 @@ func (s *server) handleGetViewerCountries(w http.ResponseWriter, r *http.Request
 					if err := rowsIsp.Scan(&cName, &ispName, &sess); err == nil {
 						code := getIsoCode(cName)
 						if ispName == "Cellular/Broadband" || ispName == "" {
-							ispName = getCountryDefaultProvider(cName)
+							items := globalGeoIPService.GetCountryISPBreakdown(cName, sess)
+							isps = append(isps, items...)
+						} else {
+							isps = append(isps, ispItem{
+								Code:    code,
+								ISP:     ispName,
+								Viewers: sess,
+							})
 						}
-						isps = append(isps, ispItem{
-							Code:    code,
-							ISP:     ispName,
-							Viewers: sess,
-						})
 					}
 				}
 			}
