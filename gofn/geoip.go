@@ -13,14 +13,29 @@ import (
 )
 
 type GeoInfo struct {
-	CountryCode  string  `json:"code"`
-	CountryName  string  `json:"country"`
-	City         string  `json:"city"`
-	Region       string  `json:"region"`
-	Lat          float64 `json:"lat"`
-	Lon          float64 `json:"lon"`
-	ISP          string  `json:"isp"`
-	IsDatacenter bool    `json:"is_dc"`
+	Query         string  `json:"query"`
+	Status        string  `json:"status"`
+	Continent     string  `json:"continent"`
+	ContinentCode string  `json:"continentCode"`
+	CountryName   string  `json:"country"`
+	CountryCode   string  `json:"countryCode"`
+	Region        string  `json:"region"`
+	RegionName    string  `json:"regionName"`
+	City          string  `json:"city"`
+	District      string  `json:"district"`
+	Zip           string  `json:"zip"`
+	Lat           float64 `json:"lat"`
+	Lon           float64 `json:"lon"`
+	Timezone      string  `json:"timezone"`
+	Offset        int     `json:"offset"`
+	Currency      string  `json:"currency"`
+	ISP           string  `json:"isp"`
+	Org           string  `json:"org"`
+	AS            string  `json:"as"`
+	ASName        string  `json:"asname"`
+	Mobile        bool    `json:"mobile"`
+	Proxy         bool    `json:"proxy"`
+	IsDatacenter  bool    `json:"hosting"`
 }
 
 type GeoIPService struct {
@@ -32,115 +47,11 @@ type GeoIPService struct {
 var globalGeoIPService = newGeoIPService()
 
 func newGeoIPService() *GeoIPService {
-	svc := &GeoIPService{
+	return &GeoIPService{
 		cache: make(map[string]GeoInfo),
 		httpClient: &http.Client{
 			Timeout: 3 * time.Second,
 		},
-	}
-	svc.seedDefaultConsumerRanges()
-	return svc
-}
-
-func (s *GeoIPService) seedDefaultConsumerRanges() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// Seed representative consumer IPs / distribution entries for regional countries
-	ugCities := []string{"Kampala", "Entebbe", "Jinja", "Mbarara", "Gulu", "Lira", "Mukono", "Mbale", "Fort Portal", "Masaka"}
-	ugIsps := []string{"Airtel", "MTN", "Savanna Fibre", "Simba Fiber", "ROKE Telkom", "Liquid Telecom"}
-	for i, city := range ugCities {
-		isp := ugIsps[i%len(ugIsps)]
-		s.cache[fmt.Sprintf("seed-ug-%d", i)] = GeoInfo{
-			CountryCode:  "UG",
-			CountryName:  "Uganda",
-			City:         city,
-			Region:       "Central Region",
-			Lat:          0.31628,
-			Lon:          32.58219,
-			ISP:          isp,
-			IsDatacenter: false,
-		}
-	}
-
-	keCities := []string{"Nairobi", "Mombasa", "Kisumu", "Nakuru", "Eldoret"}
-	keIsps := []string{"Safaricom", "Airtel", "Zuku Fiber", "Liquid Telecom"}
-	for i, city := range keCities {
-		isp := keIsps[i%len(keIsps)]
-		s.cache[fmt.Sprintf("seed-ke-%d", i)] = GeoInfo{
-			CountryCode:  "KE",
-			CountryName:  "Kenya",
-			City:         city,
-			Region:       "Nairobi County",
-			Lat:          -1.286389,
-			Lon:          36.817223,
-			ISP:          isp,
-			IsDatacenter: false,
-		}
-	}
-
-	aeCities := []string{"Dubai", "Abu Dhabi", "Sharjah", "Ajman", "Al Ain"}
-	aeIsps := []string{"Etisalat (e&)", "du"}
-	for i, city := range aeCities {
-		isp := aeIsps[i%len(aeIsps)]
-		s.cache[fmt.Sprintf("seed-ae-%d", i)] = GeoInfo{
-			CountryCode:  "AE",
-			CountryName:  "United Arab Emirates",
-			City:         city,
-			Region:       "Dubai",
-			Lat:          25.2048,
-			Lon:          55.2708,
-			ISP:          isp,
-			IsDatacenter: false,
-		}
-	}
-
-	saCities := []string{"Riyadh", "Jeddah", "Dammam", "Mecca", "Medina"}
-	saIsps := []string{"STC", "Mobily", "Zain"}
-	for i, city := range saCities {
-		isp := saIsps[i%len(saIsps)]
-		s.cache[fmt.Sprintf("seed-sa-%d", i)] = GeoInfo{
-			CountryCode:  "SA",
-			CountryName:  "Saudi Arabia",
-			City:         city,
-			Region:       "Riyadh Region",
-			Lat:          24.7136,
-			Lon:          46.6753,
-			ISP:          isp,
-			IsDatacenter: false,
-		}
-	}
-
-	gbCities := []string{"London", "Birmingham", "Manchester", "Glasgow"}
-	gbIsps := []string{"Vodafone", "BT", "Virgin Media"}
-	for i, city := range gbCities {
-		isp := gbIsps[i%len(gbIsps)]
-		s.cache[fmt.Sprintf("seed-gb-%d", i)] = GeoInfo{
-			CountryCode:  "GB",
-			CountryName:  "United Kingdom",
-			City:         city,
-			Region:       "England",
-			Lat:          51.5074,
-			Lon:          -0.1278,
-			ISP:          isp,
-			IsDatacenter: false,
-		}
-	}
-
-	usCities := []string{"New York", "Los Angeles", "Chicago", "Dallas", "Atlanta"}
-	usIsps := []string{"Verizon", "AT&T", "T-Mobile", "Comcast"}
-	for i, city := range usCities {
-		isp := usIsps[i%len(usIsps)]
-		s.cache[fmt.Sprintf("seed-us-%d", i)] = GeoInfo{
-			CountryCode:  "US",
-			CountryName:  "United States",
-			City:         city,
-			Region:       "New York",
-			Lat:          40.7128,
-			Lon:          -74.0060,
-			ISP:          isp,
-			IsDatacenter: false,
-		}
 	}
 }
 
@@ -251,14 +162,18 @@ func (s *GeoIPService) Lookup(ipStr string) GeoInfo {
 	ipStr = sanitizeIP(ipStr)
 	if ipStr == "" || ipStr == "-" || ipStr == "127.0.0.1" || ipStr == "::1" || strings.HasPrefix(ipStr, "172.") || strings.HasPrefix(ipStr, "10.") || strings.HasPrefix(ipStr, "192.168.") {
 		return GeoInfo{
-			CountryCode:  "UG",
-			CountryName:  "Uganda",
-			City:         "Kampala",
-			Region:       "Central Region",
-			Lat:          0.31628,
-			Lon:          32.58219,
-			ISP:          "Local Network",
-			IsDatacenter: false,
+			Query:         ipStr,
+			Status:        "success",
+			CountryCode:   "UG",
+			CountryName:   "Uganda",
+			City:          "Kampala",
+			Region:        "C",
+			RegionName:    "Central Region",
+			Lat:           0.31628,
+			Lon:           32.58219,
+			Timezone:      "Africa/Kampala",
+			ISP:           "Local Network",
+			IsDatacenter:  false,
 		}
 	}
 
@@ -269,11 +184,7 @@ func (s *GeoIPService) Lookup(ipStr string) GeoInfo {
 		return info
 	}
 
-	var cc, cname, city, region, isp string
-	var lat, lon float64
-	var isDC bool
-
-	apiURL := fmt.Sprintf("http://ip-api.com/json/%s?fields=status,countryCode,country,regionName,city,lat,lon,isp,hosting", ipStr)
+	apiURL := fmt.Sprintf("http://ip-api.com/json/%s?fields=66846719", ipStr)
 	req, err := http.NewRequest(http.MethodGet, apiURL, nil)
 	if err == nil {
 		resp, err := s.httpClient.Do(req)
@@ -281,50 +192,26 @@ func (s *GeoIPService) Lookup(ipStr string) GeoInfo {
 			defer resp.Body.Close()
 			if resp.StatusCode == 200 {
 				body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
-				var apiResp struct {
-					Status      string  `json:"status"`
-					CountryCode string  `json:"countryCode"`
-					Country     string  `json:"country"`
-					RegionName  string  `json:"regionName"`
-					City        string  `json:"city"`
-					Lat         float64 `json:"lat"`
-					Lon         float64 `json:"lon"`
-					ISP         string  `json:"isp"`
-					Hosting     bool    `json:"hosting"`
-				}
+				var apiResp GeoInfo
 				if err := json.Unmarshal(body, &apiResp); err == nil && apiResp.Status == "success" {
-					cc = apiResp.CountryCode
-					cname = apiResp.Country
-					city = apiResp.City
-					region = apiResp.RegionName
-					lat = apiResp.Lat
-					lon = apiResp.Lon
-					isp = normalizeISPName(apiResp.ISP)
-					isDC = apiResp.Hosting
+					info = apiResp
+					if info.Query == "" {
+						info.Query = ipStr
+					}
+					info.ISP = normalizeISPName(apiResp.ISP)
 				}
 			}
 		}
 	}
 
-	if cc == "" {
-		cc = "UG"
+	if info.CountryCode == "" {
+		info.CountryCode = "UG"
 	}
-	if cname == "" {
-		cname = "Uganda"
+	if info.CountryName == "" {
+		info.CountryName = "Uganda"
 	}
-	if isp == "" {
-		isp = "Broadband Provider"
-	}
-
-	info = GeoInfo{
-		CountryCode:  cc,
-		CountryName:  cname,
-		City:         city,
-		Region:       region,
-		Lat:          lat,
-		Lon:          lon,
-		ISP:          isp,
-		IsDatacenter: isDC,
+	if info.ISP == "" {
+		info.ISP = "Broadband Provider"
 	}
 
 	s.mu.Lock()

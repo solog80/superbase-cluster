@@ -309,6 +309,26 @@ func (s *server) handleGetViewerCountries(w http.ResponseWriter, r *http.Request
 
 	activeIPs := globalVarnishTracker.GetActiveViewerIPs(time.Duration(minutes) * time.Minute)
 
+	if len(activeIPs) == 0 && s.tsdb != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		if db, err := s.tsdbDB(ctx); err == nil {
+			rows, err := db.QueryContext(ctx, `
+				SELECT distinct coalesce(nullif(user_id, ''), nullif(device_id, ''))
+				FROM public.content_views
+				WHERE received_at > now() - ($1 * interval '1 minute')`, minutes)
+			if err == nil {
+				defer rows.Close()
+				for rows.Next() {
+					var ip string
+					if err := rows.Scan(&ip); err == nil && len(ip) > 6 && strings.Contains(ip, ".") {
+						activeIPs = append(activeIPs, ip)
+					}
+				}
+			}
+		}
+	}
+
 	countryCounts := make(map[string]int)
 	countryCodeMap := make(map[string]string)
 	countryNameMap := make(map[string]string)
