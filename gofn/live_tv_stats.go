@@ -155,9 +155,71 @@ func osGetenv(key, fallback string) string {
 	return fallback
 }
 
-// handleGetViewerStats retrieves viewer statistics per stream over recent minutes.
+// handleGetViewerStats retrieves viewer statistics per stream over recent minutes or date range from TSDB.
 func (s *server) handleGetViewerStats(w http.ResponseWriter, r *http.Request) {
-	minutes := atoiDefault(r.URL.Query().Get("minutes"), 30)
+	q := r.URL.Query()
+	minutes := atoiDefault(q.Get("minutes"), 30)
+	startDate := strings.TrimSpace(q.Get("startDate"))
+	endDate := strings.TrimSpace(q.Get("endDate"))
+
+	// If requested window is > 24 hours (1440 mins) or specific date range provided, query TimescaleDB
+	if (minutes > 1440 || startDate != "" || endDate != "") && s.tsdb != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+
+		if db, err := s.tsdbDB(ctx); err == nil {
+			bucket := "1 hour"
+			if minutes > 10080 { // > 7 days -> bucket by day
+				bucket = "1 day"
+			}
+			var timeWhere string
+			var args []any
+
+			if startDate != "" && endDate != "" {
+				timeWhere = "timestamp >= $1::timestamptz AND timestamp <= ($2::date + interval '1 day')::timestamptz"
+				args = append(args, startDate, endDate)
+			} else {
+				timeWhere = "timestamp >= now() - ($1 * interval '1 minute')"
+				args = append(args, minutes)
+			}
+
+			query := fmt.Sprintf(`
+				SELECT time_bucket('%s', timestamp) as bucket_time,
+				       case when content_id like '%%stream2%%' or content_id like '%%salt_tv_two%%' then 'stream2' else 'stream' end as st,
+				       count(distinct coalesce(user_id, device_id)) as v
+				FROM public.content_sessions
+				WHERE %s
+				GROUP BY 1, 2
+				ORDER BY 1 ASC`, bucket, timeWhere)
+
+			rows, err := db.QueryContext(ctx, query, args...)
+			if err == nil {
+				defer rows.Close()
+				var history []map[string]any
+				for rows.Next() {
+					var bTime time.Time
+					var st string
+					var v int
+					if err := rows.Scan(&bTime, &st, &v); err == nil {
+						history = append(history, map[string]any{
+							"minute":  bTime.Format(time.RFC3339),
+							"stream":  st,
+							"viewers": v,
+						})
+					}
+				}
+				if len(history) > 0 {
+					writeJSON(w, http.StatusOK, map[string]any{
+						"viewers": history,
+						"minutes": minutes,
+						"source":  "timescaledb_historical",
+					})
+					return
+				}
+			}
+		}
+	}
+
 	if minutes < 1 {
 		minutes = 1
 	}
@@ -171,6 +233,7 @@ func (s *server) handleGetViewerStats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"viewers": history,
 		"minutes": minutes,
+		"source":  "varnish_realtime_ring",
 	})
 }
 
