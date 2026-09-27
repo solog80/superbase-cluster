@@ -132,6 +132,34 @@ func (s *server) handleGetLiveTvStats(w http.ResponseWriter, r *http.Request) {
 	viewers := vStats.TotalViewers
 	stMap := vStats.StreamCounts
 
+	if (viewers == 0 || len(stMap) == 0) && s.tsdb != nil {
+		if db, err := s.tsdbDB(ctx); err == nil {
+			var tsdbViewers int
+			_ = db.QueryRowContext(ctx, "SELECT count(distinct coalesce(user_id, device_id)) FROM public.content_views WHERE received_at > now() - interval '3 minutes'").Scan(&tsdbViewers)
+			if tsdbViewers > 0 {
+				viewers = tsdbViewers
+			}
+
+			rows, err := db.QueryContext(ctx, `
+				SELECT case when content_id like '%stream2%' or content_id like '%salt_tv_two%' then 'stream2' else 'stream' end as st,
+				       count(distinct coalesce(user_id, device_id))
+				FROM public.content_views
+				WHERE received_at > now() - interval '3 minutes'
+				GROUP BY 1`)
+			if err == nil {
+				defer rows.Close()
+				stMap = map[string]int{}
+				for rows.Next() {
+					var st string
+					var cnt int
+					if err := rows.Scan(&st, &cnt); err == nil {
+						stMap[st] = cnt
+					}
+				}
+			}
+		}
+	}
+
 	resp := map[string]any{
 		"viewers":            viewers,
 		"total_connections":  viewers,
