@@ -116,9 +116,9 @@ Envoy geo clusters cascade to **any surviving region** via `priority` levels. En
 
 ### Cloudflare entry + caching (free tier) ✅
 - **Tunnel `edge-us1`** on us1 (cloudflared systemd service): `edge.solofx.net` → `http://localhost:8555`. DNS: `edge.solofx.net` CNAME → `e30a6a5c-69d1-4ba6-8e09-2392f300df95.cfargotunnel.com` (proxied).
-- **Cache Worker `edge-cache`** on `edge.solofx.net/*` (Cache API, `caches.default`): caches **anon-role** `GET/HEAD /rest/v1/*` (JWT `role=anon`) with 60s TTL; passes through Studio/basic-auth, writes, authenticated reads, storage, realtime. Forwards `CF-IPCountry` so geo-routing survives the proxy.
-- **Relay Worker `origin-relay`** on `origin-relay.solog80.workers.dev`: forwards to `https://us1-edge.solofx.net` (Workers on the same zone can't fetch a same-zone proxied hostname — 1003 loop protection — so the cache worker goes via the workers.dev relay; raw origin IPs are also 1003-blocked).
-- Origin Rules are **paid** on this plan; Cache Rules are **paid** too → the Worker path is the free caching option. Verified: anon read MISS→HIT, Studio 307, writes pass-through, `cf-cache-status` stays DYNAMIC (app-level cache).
+- **Metadata Worker `edge-cache`** on `edge.solofx.net/.well-known/*`: serves Android/iOS Digital Asset Links (`assetlinks.json`, `apple-app-site-association`).
+- **Native Tunnel Bypass for API Traffic**: All `/api/v1/*`, `/rest/v1/*`, and `/storage/v1/*` traffic bypasses Workers completely, passing directly through Cloudflare Tunnel (`edge-us1`) to Envoy on port 8555 with 0 Cloudflare Worker costs.
+- ⚠️ **CAUTION**: Do NOT attach `edge-cache` worker to wildcard `edge.solofx.net/*`. Keep pattern scoped to `edge.solofx.net/.well-known/*` so API calls bypass Workers natively.
 
 ---
 
