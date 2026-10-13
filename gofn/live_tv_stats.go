@@ -251,6 +251,52 @@ func (s *server) handleGetViewerStats(w http.ResponseWriter, r *http.Request) {
 			if minutes > 10080 {
 				bucket = "1 day"
 			}
+			// 1. Primary: query public.varnish_stream_snapshots (real Varnish live stream snapshots)
+			var timeWhereSnap string
+			var argsSnap []any
+			if startDate != "" && endDate != "" {
+				timeWhereSnap = "timestamp >= $1::timestamptz AND timestamp <= ($2::date + interval '1 day')::timestamptz"
+				argsSnap = append(argsSnap, startDate, endDate)
+			} else {
+				timeWhereSnap = "timestamp >= now() - ($1 * interval '1 minute')"
+				argsSnap = append(argsSnap, minutes)
+			}
+
+			vQuery := fmt.Sprintf(`
+				SELECT time_bucket('%s', timestamp) as bucket_time,
+				       case when stream in ('tv2/live', 'stream2') then 'tv2/live' else 'tv1/stream' end as st,
+				       round(avg(viewers))::int as v
+				FROM public.varnish_stream_snapshots
+				WHERE %s
+				GROUP BY 1, 2
+				ORDER BY 1 ASC`, bucket, timeWhereSnap)
+
+			if vRows, vErr := db.QueryContext(ctx, vQuery, argsSnap...); vErr == nil {
+				defer vRows.Close()
+				var vHistory []map[string]any
+				for vRows.Next() {
+					var bTime time.Time
+					var st string
+					var v int
+					if err := vRows.Scan(&bTime, &st, &v); err == nil {
+						vHistory = append(vHistory, map[string]any{
+							"minute":  bTime.Format(time.RFC3339),
+							"stream":  st,
+							"viewers": v,
+						})
+					}
+				}
+				if len(vHistory) > 0 {
+					writeJSON(w, http.StatusOK, map[string]any{
+						"viewers": vHistory,
+						"minutes": minutes,
+						"source":  "timescaledb_varnish_snapshots",
+					})
+					return
+				}
+			}
+
+			// 2. Secondary fallback: query content_views
 			var timeWhere string
 			var args []any
 
