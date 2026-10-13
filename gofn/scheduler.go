@@ -22,47 +22,58 @@ func (s *server) startScheduler() {
 		log.Println("scheduler: disabled (no TSDB config)")
 		return
 	}
-	if getenv("AZURACAST_API_KEY", "") == "" {
-		log.Println("scheduler: disabled (no AZURACAST_API_KEY)")
-		return
-	}
-	log.Println("scheduler: starting radio sync jobs")
 
+	// Persist live Varnish stream viewer snapshots into TSDB every minute for Live TV
 	go s.runEvery(time.Minute, func(ctx context.Context) {
-		n, err := s.snapshotRadioNowPlaying(ctx, saltFMStation)
-		if err != nil {
-			log.Printf("scheduler nowplaying: %v", err)
-			return
+		globalVarnishTracker.RecordMinuteSnapshot()
+		if err := s.persistVarnishSnapshot(ctx); err != nil {
+			log.Printf("scheduler varnish snapshot: %v", err)
+		} else {
+			log.Printf("scheduler varnish snapshot: ok")
 		}
-		log.Printf("scheduler nowplaying: +%d", n)
 	})
 
-	go s.runEvery(5*time.Minute, func(ctx context.Context) {
-		n, err := s.snapshotRadioListeners(ctx, saltFMStation)
-		if err != nil {
-			log.Printf("scheduler listeners: %v", err)
-			return
-		}
-		log.Printf("scheduler listeners: +%d", n)
-	})
+	if getenv("AZURACAST_API_KEY", "") == "" {
+		log.Println("scheduler radio sync: disabled (no AZURACAST_API_KEY)")
+	} else {
+		log.Println("scheduler: starting radio sync jobs")
 
-	go s.runEvery(time.Hour, func(ctx context.Context) {
-		n, err := s.syncRadioHistory(ctx, saltFMStation)
-		if err != nil {
-			log.Printf("scheduler history: %v", err)
-			return
-		}
-		log.Printf("scheduler history: +%d", n)
-	})
+		go s.runEvery(time.Minute, func(ctx context.Context) {
+			n, err := s.snapshotRadioNowPlaying(ctx, saltFMStation)
+			if err != nil {
+				log.Printf("scheduler nowplaying: %v", err)
+				return
+			}
+			log.Printf("scheduler nowplaying: +%d", n)
+		})
 
-	go s.runEvery(6*time.Hour, func(ctx context.Context) {
-		counts, err := s.syncRadioCharts(ctx, saltFMStation)
-		if err != nil {
-			log.Printf("scheduler reports: %v", err)
-			return
-		}
-		log.Printf("scheduler reports: %v", counts)
-	})
+		go s.runEvery(5*time.Minute, func(ctx context.Context) {
+			n, err := s.snapshotRadioListeners(ctx, saltFMStation)
+			if err != nil {
+				log.Printf("scheduler listeners: %v", err)
+				return
+			}
+			log.Printf("scheduler listeners: +%d", n)
+		})
+
+		go s.runEvery(time.Hour, func(ctx context.Context) {
+			n, err := s.syncRadioHistory(ctx, saltFMStation)
+			if err != nil {
+				log.Printf("scheduler history: %v", err)
+				return
+			}
+			log.Printf("scheduler history: +%d", n)
+		})
+
+		go s.runEvery(6*time.Hour, func(ctx context.Context) {
+			counts, err := s.syncRadioCharts(ctx, saltFMStation)
+			if err != nil {
+				log.Printf("scheduler reports: %v", err)
+				return
+			}
+			log.Printf("scheduler reports: %v", counts)
+		})
+	}
 
 	// EPG cache warm + metadata sync (replaces scheduleEPGCacheRefresh, 12h).
 	go s.runEvery(12*time.Hour, func(ctx context.Context) {

@@ -140,8 +140,8 @@ GROUP BY 1, 2, 3;
 
 SELECT add_continuous_aggregate_policy('public.watch_progress_daily',
   start_offset => INTERVAL '90 days',
-  end_offset => INTERVAL '1 hour',
-  schedule_interval => INTERVAL '1 hour',
+  end_offset => INTERVAL '0s',
+  schedule_interval => INTERVAL '5 minutes',
   if_not_exists => true);
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS public.content_views_daily
@@ -157,8 +157,8 @@ GROUP BY 1, 2, 3;
 
 SELECT add_continuous_aggregate_policy('public.content_views_daily',
   start_offset => INTERVAL '90 days',
-  end_offset => INTERVAL '1 hour',
-  schedule_interval => INTERVAL '1 hour',
+  end_offset => INTERVAL '0s',
+  schedule_interval => INTERVAL '5 minutes',
   if_not_exists => true);
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS public.content_sessions_daily
@@ -175,8 +175,8 @@ GROUP BY 1, 2, 3, 4;
 
 SELECT add_continuous_aggregate_policy('public.content_sessions_daily',
   start_offset => INTERVAL '90 days',
-  end_offset => INTERVAL '1 hour',
-  schedule_interval => INTERVAL '1 hour',
+  end_offset => INTERVAL '0s',
+  schedule_interval => INTERVAL '5 minutes',
   if_not_exists => true);
 
 -- get_analytics_metrics — replaces getAnalyticsMetrics (9 BigQuery queries).
@@ -421,4 +421,34 @@ $$;
 
 grant execute on function public.get_analytics_metrics() to postgres;
 grant execute on function public.get_analytics_metrics(integer, date, date) to postgres;
+
+-- =============================================================
+-- Varnish Stream Snapshots Hypertable & Hourly Continuous Aggregate
+-- =============================================================
+CREATE TABLE IF NOT EXISTS public.varnish_stream_snapshots (
+  timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  stream TEXT NOT NULL,
+  viewers INT NOT NULL,
+  country_code TEXT DEFAULT ''
+);
+
+SELECT create_hypertable('public.varnish_stream_snapshots', 'timestamp', if_not_exists => true);
+CREATE INDEX IF NOT EXISTS varnish_stream_snapshots_ts_idx ON public.varnish_stream_snapshots (timestamp DESC);
+CREATE INDEX IF NOT EXISTS varnish_stream_snapshots_stream_idx ON public.varnish_stream_snapshots (stream, timestamp DESC);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.varnish_stream_hourly
+WITH (timescaledb.continuous) AS
+SELECT
+  time_bucket('1 hour', timestamp) AS bucket,
+  stream,
+  round(avg(viewers))::int AS avg_viewers,
+  max(viewers) AS peak_viewers
+FROM public.varnish_stream_snapshots
+GROUP BY 1, 2;
+
+SELECT add_continuous_aggregate_policy('public.varnish_stream_hourly',
+  start_offset => INTERVAL '90 days',
+  end_offset => INTERVAL '0s',
+  schedule_interval => INTERVAL '5 minutes',
+  if_not_exists => true);
 

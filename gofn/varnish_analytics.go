@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -68,6 +69,41 @@ func (vt *VarnishWindowTracker) RecordMinuteSnapshot() {
 		vt.history = vt.history[len(vt.history)-1440:]
 	}
 	vt.lastSnapshot = now
+}
+
+// CurrentCounts returns the active 30s window concurrent viewer count for stream (Salt TV One) and stream2 (Salt TV Two).
+func (vt *VarnishWindowTracker) CurrentCounts() (int, int) {
+	vt.mu.RLock()
+	defer vt.mu.RUnlock()
+
+	cutoff := time.Now().Add(-30 * time.Second)
+	s1, s2 := 0, 0
+	for _, sess := range vt.sessions {
+		if sess.LastSeen.After(cutoff) {
+			if sess.Stream == "stream" {
+				s1++
+			} else if sess.Stream == "stream2" {
+				s2++
+			}
+		}
+	}
+	return s1, s2
+}
+
+func (s *server) persistVarnishSnapshot(ctx context.Context) error {
+	db, err := s.tsdbDB(ctx)
+	if err != nil {
+		return err
+	}
+	s1, s2 := globalVarnishTracker.CurrentCounts()
+	now := time.Now().UTC().Truncate(time.Minute)
+
+	_, err = db.ExecContext(ctx,
+		`INSERT INTO public.varnish_stream_snapshots (timestamp, stream, viewers)
+         VALUES ($1, 'stream', $2), ($1, 'stream2', $3)`,
+		now, s1, s2,
+	)
+	return err
 }
 
 func (vt *VarnishWindowTracker) GetHistory(requestedMinutes int) []map[string]any {
@@ -149,11 +185,11 @@ func (vt *VarnishWindowTracker) RecordHit(ip, rawURI string) {
 		go globalGeoIPService.Lookup(ip)
 	}
 
-	// Identify stream name from request path
+	// Identify stream name from request path (supports new /tv1/stream/ and /tv2/live/, and legacy /app/stream/)
 	var stream string
-	if strings.Contains(rawURI, "/app/stream2/") {
+	if strings.Contains(rawURI, "/tv2/") || strings.Contains(rawURI, "stream2") {
 		stream = "stream2"
-	} else if strings.Contains(rawURI, "/app/stream/") {
+	} else if strings.Contains(rawURI, "/tv1/") || strings.Contains(rawURI, "/app/stream") || strings.Contains(rawURI, "stream") {
 		stream = "stream"
 	} else {
 		return // Ignore non-live-stream traffic
@@ -244,10 +280,10 @@ func (vt *VarnishWindowTracker) GetStats(windowDuration time.Duration) LiveStats
 
 	cutoff := time.Now().Add(-windowDuration)
 	streamCounts := map[string]int{
-		"stream":               0,
-		"stream2":              0,
-		"app/stream/abr.m3u8":  0,
-		"app/stream2/abr.m3u8": 0,
+		"tv1/stream":          0,
+		"tv2/live":            0,
+		"tv1/stream/abr.m3u8": 0,
+		"tv2/live/abr.m3u8":   0,
 	}
 	total := 0
 
@@ -255,11 +291,11 @@ func (vt *VarnishWindowTracker) GetStats(windowDuration time.Duration) LiveStats
 		if sess.LastSeen.After(cutoff) {
 			total++
 			if sess.Stream == "stream" {
-				streamCounts["stream"]++
-				streamCounts["app/stream/abr.m3u8"]++
+				streamCounts["tv1/stream"]++
+				streamCounts["tv1/stream/abr.m3u8"]++
 			} else if sess.Stream == "stream2" {
-				streamCounts["stream2"]++
-				streamCounts["app/stream2/abr.m3u8"]++
+				streamCounts["tv2/live"]++
+				streamCounts["tv2/live/abr.m3u8"]++
 			}
 		}
 	}

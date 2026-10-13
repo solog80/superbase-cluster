@@ -41,7 +41,7 @@ type OMENativeResponse struct {
 }
 
 // fetchOMENativeStats queries OvenMediaEngine's native REST API (/v1/stats/current/...) on port 8091.
-func (s *server) fetchOMENativeStats(ctx context.Context, subPath string) (*OMENativeResponse, error) {
+func (s *server) fetchOMENativeStats(ctx context.Context, apiPath string) (*OMENativeResponse, error) {
 	hosts := []string{
 		getenv("OME_API_HOST", ""),
 		"http://172.27.0.1:8091",
@@ -54,13 +54,17 @@ func (s *server) fetchOMENativeStats(ctx context.Context, subPath string) (*OMEN
 		omeToken = osGetenv("OME_API_TOKEN", "s4lt5tv_0me_api_2026")
 	}
 
+	if !strings.HasPrefix(apiPath, "/") {
+		apiPath = "/" + apiPath
+	}
+
 	var lastErr error
 	for _, omeHost := range hosts {
 		if omeHost == "" {
 			continue
 		}
 		attemptCtx, attemptCancel := context.WithTimeout(ctx, 1500*time.Millisecond)
-		targetURL := fmt.Sprintf("%s/v1/stats/current/vhosts/default/apps/app%s", omeHost, subPath)
+		targetURL := fmt.Sprintf("%s%s", omeHost, apiPath)
 		req, err := http.NewRequestWithContext(attemptCtx, http.MethodGet, targetURL, nil)
 		if err != nil {
 			attemptCancel()
@@ -97,14 +101,14 @@ func (s *server) fetchOMENativeStats(ctx context.Context, subPath string) (*OMEN
 
 		var out OMENativeResponse
 		if err := json.Unmarshal(body, &out); err != nil {
-			log.Printf("ome json unmarshal %s %s err: %v body: %s", subPath, omeHost, err, string(body))
+			log.Printf("ome json unmarshal %s %s err: %v body: %s", apiPath, omeHost, err, string(body))
 			lastErr = err
 			continue
 		}
-		log.Printf("ome success %s %s status: %d conn: %d", subPath, omeHost, out.StatusCode, out.Response.TotalConnections)
+		log.Printf("ome success %s %s status: %d conn: %d max_conn: %d out: %d in: %d", apiPath, omeHost, out.StatusCode, out.Response.TotalConnections, out.Response.MaxTotalConnections, out.Response.LastThroughputOut, out.Response.LastThroughputIn)
 		return &out, nil
 	}
-	log.Printf("ome all hosts failed %s err: %v", subPath, lastErr)
+	log.Printf("ome all hosts failed %s err: %v", apiPath, lastErr)
 	return nil, lastErr
 }
 
@@ -117,16 +121,44 @@ func (s *server) handleGetLiveTvStats(w http.ResponseWriter, r *http.Request) {
 
 	vStats := globalVarnishTracker.GetStats(30 * time.Second)
 
-	// Fetch native OME stats for throughput metrics
+	// Fetch native OME stats for throughput and max connections
 	var sumThroughputOut int64 = 0
 	var sumThroughputIn int64 = 0
-	if stream1, err := s.fetchOMENativeStats(ctx, "/streams/stream"); err == nil && stream1 != nil && stream1.StatusCode == 200 {
-		sumThroughputOut += stream1.Response.LastThroughputOut
-		sumThroughputIn += stream1.Response.LastThroughputIn
-	}
-	if stream2, err := s.fetchOMENativeStats(ctx, "/streams/stream2"); err == nil && stream2 != nil && stream2.StatusCode == 200 {
-		sumThroughputOut += stream2.Response.LastThroughputOut
-		sumThroughputIn += stream2.Response.LastThroughputIn
+	var maxTotalConnections int = 0
+
+	// 1. Try querying aggregated vhost stats first (/v1/stats/current/vhosts/default)
+	if vStatsOME, err := s.fetchOMENativeStats(ctx, "/v1/stats/current/vhosts/default"); err == nil && vStatsOME != nil && vStatsOME.StatusCode == 200 {
+		sumThroughputOut = vStatsOME.Response.LastThroughputOut
+		sumThroughputIn = vStatsOME.Response.LastThroughputIn
+		if sumThroughputOut == 0 && vStatsOME.Response.AvgThroughputOut > 0 {
+			sumThroughputOut = vStatsOME.Response.AvgThroughputOut / 8
+		}
+		if sumThroughputIn == 0 && vStatsOME.Response.AvgThroughputIn > 0 {
+			sumThroughputIn = vStatsOME.Response.AvgThroughputIn / 8
+		}
+		maxTotalConnections = vStatsOME.Response.MaxTotalConnections
+	} else {
+		// Fallback: query per-stream endpoints
+		for _, streamPath := range []string{
+			"/v1/stats/current/vhosts/default/apps/tv1/streams/stream",
+			"/v1/stats/current/vhosts/default/apps/tv2/streams/live",
+		} {
+			if sStats, err := s.fetchOMENativeStats(ctx, streamPath); err == nil && sStats != nil && sStats.StatusCode == 200 {
+				out := sStats.Response.LastThroughputOut
+				if out == 0 && sStats.Response.AvgThroughputOut > 0 {
+					out = sStats.Response.AvgThroughputOut / 8
+				}
+				in := sStats.Response.LastThroughputIn
+				if in == 0 && sStats.Response.AvgThroughputIn > 0 {
+					in = sStats.Response.AvgThroughputIn / 8
+				}
+				sumThroughputOut += out
+				sumThroughputIn += in
+				if sStats.Response.MaxTotalConnections > maxTotalConnections {
+					maxTotalConnections = sStats.Response.MaxTotalConnections
+				}
+			}
+		}
 	}
 
 	viewers := vStats.TotalViewers
@@ -141,7 +173,7 @@ func (s *server) handleGetLiveTvStats(w http.ResponseWriter, r *http.Request) {
 			}
 
 			rows, err := db.QueryContext(ctx, `
-				SELECT case when content_id like '%stream2%' or content_id like '%salt_tv_two%' then 'stream2' else 'stream' end as st,
+				SELECT case when content_id like '%tv2%' or content_id like '%stream2%' or content_id like '%salt_tv_two%' then 'tv2/live' else 'tv1/stream' end as st,
 				       count(distinct coalesce(user_id, device_id))
 				FROM public.content_views
 				WHERE received_at > now() - interval '3 minutes'
@@ -160,24 +192,30 @@ func (s *server) handleGetLiveTvStats(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	sumStreams := 0
-	for _, cnt := range stMap {
-		sumStreams += cnt
+	tv1Count := stMap["tv1/stream"]
+	if tv1Count == 0 {
+		tv1Count = stMap["stream"]
 	}
-	if sumStreams > viewers {
+	tv2Count := stMap["tv2/live"]
+	if tv2Count == 0 {
+		tv2Count = stMap["stream2"]
+	}
+	sumStreams := tv1Count + tv2Count
+	if viewers < sumStreams {
 		viewers = sumStreams
 	}
 
 	resp := map[string]any{
-		"viewers":            viewers,
-		"total_connections":  viewers,
-		"llhls_connections":  viewers,
-		"webrtc_connections": 0,
-		"streams":            stMap,
-		"avg_throughput_out": sumThroughputOut,
-		"avg_throughput_in":  sumThroughputIn,
-		"window_seconds":     vStats.WindowSeconds,
-		"source":             "varnish_30s_window",
+		"viewers":               viewers,
+		"total_connections":     viewers,
+		"llhls_connections":     viewers,
+		"webrtc_connections":    0,
+		"streams":               stMap,
+		"avg_throughput_out":    sumThroughputOut,
+		"avg_throughput_in":     sumThroughputIn,
+		"max_total_connections": maxTotalConnections,
+		"window_seconds":        vStats.WindowSeconds,
+		"source":                "varnish_30s_window",
 	}
 
 	writeJSON(w, http.StatusOK, resp)
@@ -226,7 +264,7 @@ func (s *server) handleGetViewerStats(w http.ResponseWriter, r *http.Request) {
 
 			query := fmt.Sprintf(`
 				SELECT time_bucket('%s', received_at) as bucket_time,
-				       case when content_id like '%%stream2%%' or content_id like '%%salt_tv_two%%' then 'stream2' else 'stream' end as st,
+				       case when content_id like '%%tv2%%' or content_id like '%%stream2%%' or content_id like '%%salt_tv_two%%' then 'tv2/live' else 'tv1/stream' end as st,
 				       count(distinct coalesce(user_id, device_id)) as v
 				FROM public.content_views
 				WHERE %s
