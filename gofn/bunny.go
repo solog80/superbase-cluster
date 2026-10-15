@@ -34,9 +34,9 @@ type bunnyVideo struct {
 	Hostname         string  `json:"hostname"`
 }
 
-// fetchBunnyVideo polls Bunny until the video is ready (status >= 4) and
-// returns its metadata. Mirrors the old Firebase createEpisodeFromBunnyUpload
-// wait-for-transcode behaviour, now run by the mesh.
+// fetchBunnyVideo fetches Bunny video metadata immediately. If the video is still
+// transcoding (status < 4), it returns the metadata immediately with duration if
+// available, avoiding long HTTP blocking that causes gateway timeouts.
 func fetchBunnyVideo(client *http.Client, videoID string) (*bunnyVideo, error) {
 	if bunnyAPIKey() == "" || bunnyLibraryID() == "" {
 		return nil, fmt.Errorf("BUNNY_API_KEY / BUNNY_LIBRARY_ID not set")
@@ -47,29 +47,30 @@ func fetchBunnyVideo(client *http.Client, videoID string) (*bunnyVideo, error) {
 		return nil, err
 	}
 	req.Header.Set("AccessKey", bunnyAPIKey())
-	var last *bunnyVideo
-	for i := 0; i < 12; i++ {
+
+	// Up to 3 attempts with 1s pause in case the newly created video is propagating
+	for i := 0; i < 3; i++ {
 		resp, err := client.Do(req)
 		if err != nil {
-			return nil, err
+			if i == 2 {
+				return nil, err
+			}
+			time.Sleep(1 * time.Second)
+			continue
 		}
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 		resp.Body.Close()
-		if resp.StatusCode >= 300 {
-			return nil, fmt.Errorf("bunny fetch %s: %d %s", videoID, resp.StatusCode, string(b))
-		}
-		var v bunnyVideo
-		if err := json.Unmarshal(b, &v); err != nil {
-			return nil, err
-		}
-		last = &v
-		if v.Status >= 4 {
+		if resp.StatusCode == http.StatusOK {
+			var v bunnyVideo
+			if err := json.Unmarshal(b, &v); err != nil {
+				return nil, err
+			}
 			return &v, nil
 		}
-		time.Sleep(3 * time.Second)
+		if resp.StatusCode != http.StatusNotFound || i == 2 {
+			return nil, fmt.Errorf("bunny fetch %s: %d %s", videoID, resp.StatusCode, string(b))
+		}
+		time.Sleep(1 * time.Second)
 	}
-	if last == nil {
-		return nil, fmt.Errorf("bunny video %s gave no data", videoID)
-	}
-	return last, nil
+	return nil, fmt.Errorf("bunny video %s not found", videoID)
 }

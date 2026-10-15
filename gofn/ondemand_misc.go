@@ -145,6 +145,7 @@ func sfxHMAC(path string, exp int64, secret string) string {
 // refreshOndemandCache rebuilds the in-memory on-demand payload (mirrors
 // scheduleOnDemandCacheRefresh, which ran every 6 hours).
 func (s *server) refreshOndemandCache(ctx context.Context) error {
+	s.clearOndemandCache()
 	_, _, _, err := s.ondemandPayload(ctx)
 	return err
 }

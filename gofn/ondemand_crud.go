@@ -467,6 +467,10 @@ func (s *server) handleCreateSfxEpisode(w http.ResponseWriter, r *http.Request) 
 			if body.Title == "" {
 				body.Title = v.Title
 			}
+			if v.Status < 4 && body.Processing == nil {
+				isProc := true
+				body.Processing = &isProc
+			}
 		}
 		body.VideoID = ""
 	}
