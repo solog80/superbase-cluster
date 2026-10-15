@@ -1,0 +1,523 @@
+package main
+
+import (
+	"context"
+	"crypto/md5"
+	"encoding/csv"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// stationLocation is Salt FM / Kampala timezone (UTC+3)
+var stationLocation = time.FixedZone("EAT", 3*3600)
+
+// TrafficRecord represents one aired spot / track from StationPlaylist Studio
+type TrafficRecord struct {
+	PlayedAt        string `json:"played_at"`        // "14/10/2026 08:16:41" or RFC3339
+	ScheduledAt     string `json:"scheduled_at"`     // "13/10/2026 23:00" or RFC3339
+	TrackType       string `json:"track_type"`       // "Spot", "Manual", etc.
+	Client          string `json:"client"`          // Advertiser / Sponsor name
+	Title           string `json:"title"`           // Ad copy title
+	Artist          string `json:"artist"`          // Campaign / artist
+	DurationSeconds int    `json:"duration_seconds"` // Airtime in seconds
+	Category        string `json:"category"`        // Category / Spot Group
+	Filename        string `json:"filename"`        // Playout path e.g. F:\Adverts\...
+	UserDJ          string `json:"user_dj"`         // Playout user/presenter
+	Listeners       int    `json:"listeners"`
+}
+
+type trafficIngestRequest struct {
+	StationID int             `json:"station_id"`
+	Records   []TrafficRecord `json:"records"`
+}
+
+// defaultClientPatterns maps common audio filenames & titles to advertisers
+var defaultClientPatterns = []struct {
+	client  string
+	pattern *regexp.Regexp
+}{
+	{"Minute Maid", regexp.MustCompile(`(?i)MINUTE\s*MAID`)},
+	{"MTN", regexp.MustCompile(`(?i)\bMTN\b`)},
+	{"Airtel", regexp.MustCompile(`(?i)\bAIRTEL\b`)},
+	{"Plascon", regexp.MustCompile(`(?i)PLASCON`)},
+	{"Syova Seeds", regexp.MustCompile(`(?i)SYOVA`)},
+	{"Advanta Seeds", regexp.MustCompile(`(?i)ADVANTA`)},
+	{"Global Paints", regexp.MustCompile(`(?i)GLOBAL\s*PAINTS`)},
+	{"Ebenezer Hardware", regexp.MustCompile(`(?i)EBENEZER`)},
+	{"Kubera Motors", regexp.MustCompile(`(?i)KUBERA`)},
+	{"URA", regexp.MustCompile(`(?i)\b(URA|EFRIS)\b`)},
+	{"Levixone Concert", regexp.MustCompile(`(?i)LEVIXONE`)},
+	{"Sky View", regexp.MustCompile(`(?i)SKY\s*VIEW`)},
+	{"Salt Media (House Promo)", regexp.MustCompile(`(?i)SALT\s*(MEDIA|APP|LUG\s*APP|ENG\s*APP)`)},
+	{"Health Tip (Sponsored)", regexp.MustCompile(`(?i)HEALTH\s*TIP`)},
+}
+
+// resolveTrafficClient infers the advertiser if Client column is empty in manual logs
+func resolveTrafficClient(title, filename, explicit string) string {
+	if strings.TrimSpace(explicit) != "" {
+		return strings.TrimSpace(explicit)
+	}
+	target := title + " " + filename
+	for _, p := range defaultClientPatterns {
+		if p.pattern.MatchString(target) {
+			return p.client
+		}
+	}
+	if strings.Contains(strings.ToLower(filename), "advert") || strings.Contains(strings.ToLower(title), "advert") {
+		return "Other Advert"
+	}
+	return "Unassigned"
+}
+
+// parseTrafficTimestamp parses StationPlaylist dates (DD/MM/YYYY HH:MM:SS) or ISO
+func parseTrafficTimestamp(raw string) (time.Time, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return time.Time{}, fmt.Errorf("empty timestamp")
+	}
+
+	// Try RFC3339 first
+	if t, err := time.Parse(time.RFC3339, raw); err == nil {
+		return t, nil
+	}
+
+	// Try StationPlaylist formats: "14/10/2026 08:16:41" or "14/10/2026 08:16"
+	layouts := []string{
+		"02/01/2006 15:04:05",
+		"02/01/2006 15:04",
+		"2006-01-02 15:04:05",
+		"2006-01-02 15:04",
+		"02-01-2006 15:04:05",
+		"02-01-2006 15:04",
+	}
+
+	for _, layout := range layouts {
+		if t, err := time.ParseInLocation(layout, raw, stationLocation); err == nil {
+			return t, nil
+		}
+	}
+
+	return time.Time{}, fmt.Errorf("unknown date format: %q", raw)
+}
+
+// parseDurationMMSS converts "00:30" or "04:29" or raw seconds into integer seconds
+func parseDurationMMSS(raw string) int {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0
+	}
+	if sec, err := strconv.Atoi(raw); err == nil {
+		return sec
+	}
+	parts := strings.Split(raw, ":")
+	if len(parts) == 2 {
+		m, _ := strconv.Atoi(parts[0])
+		s, _ := strconv.Atoi(parts[1])
+		return m*60 + s
+	} else if len(parts) == 3 {
+		h, _ := strconv.Atoi(parts[0])
+		m, _ := strconv.Atoi(parts[1])
+		s, _ := strconv.Atoi(parts[2])
+		return h*3600 + m*60 + s
+	}
+	return 0
+}
+
+func computeTrafficHash(stationID int, playedAt time.Time, filename, title string) string {
+	sum := md5.Sum([]byte(fmt.Sprintf("%d|%d|%s|%s", stationID, playedAt.Unix(), filename, title)))
+	return hex.EncodeToString(sum[:])
+}
+
+// handleIngestTrafficLogs receives batches from the StationPlaylist agent / script
+func (s *server) handleIngestTrafficLogs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "POST required"})
+		return
+	}
+
+	var req trafficIngestRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 10<<20)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid json: " + err.Error()})
+		return
+	}
+
+	if req.StationID == 0 {
+		req.StationID = 307 // Default Salt FM
+	}
+
+	if len(req.Records) == 0 {
+		writeJSON(w, http.StatusOK, map[string]any{"success": true, "inserted": 0})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	inserted, err := s.insertTrafficRecords(ctx, req.StationID, req.Records)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "insert failed: " + err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"success":  true,
+		"station":  req.StationID,
+		"received": len(req.Records),
+		"inserted": inserted,
+	})
+}
+
+// insertTrafficRecords performs fast bulk-inserts using multi-row batching
+func (s *server) insertTrafficRecords(ctx context.Context, stationID int, records []TrafficRecord) (int, error) {
+	if len(records) == 0 {
+		return 0, nil
+	}
+
+	cols := []string{
+		"station_id", "played_at", "scheduled_at", "track_type", "client", "title", "artist",
+		"duration_seconds", "category", "filename", "user_dj", "listeners", "variance_seconds", "log_hash",
+	}
+
+	rows := make([]map[string]any, 0, len(records))
+	for _, rec := range records {
+		playedAt, perr := parseTrafficTimestamp(rec.PlayedAt)
+		if perr != nil {
+			continue
+		}
+
+		var schedAt any
+		var variance any
+		if rec.ScheduledAt != "" {
+			if st, serr := parseTrafficTimestamp(rec.ScheduledAt); serr == nil {
+				schedAt = st
+				diff := int(playedAt.Sub(st).Seconds())
+				variance = diff
+			}
+		}
+
+		client := resolveTrafficClient(rec.Title, rec.Filename, rec.Client)
+		trackType := rec.TrackType
+		if trackType == "" || trackType == "0" {
+			trackType = "Spot"
+		}
+		hash := computeTrafficHash(stationID, playedAt, rec.Filename, rec.Title)
+
+		row := map[string]any{
+			"station_id":       stationID,
+			"played_at":        playedAt,
+			"scheduled_at":     schedAt,
+			"track_type":       trackType,
+			"client":           client,
+			"title":            rec.Title,
+			"artist":           rec.Artist,
+			"duration_seconds": rec.DurationSeconds,
+			"category":         rec.Category,
+			"filename":         rec.Filename,
+			"user_dj":          rec.UserDJ,
+			"listeners":        rec.Listeners,
+			"variance_seconds": variance,
+			"log_hash":         hash,
+		}
+		rows = append(rows, row)
+	}
+
+	if len(rows) == 0 {
+		return 0, nil
+	}
+
+	db, err := s.tsdbDB(ctx)
+	if err != nil {
+		return 0, err
+	}
+
+	totalInserted := 0
+	chunkSize := 100
+	for i := 0; i < len(rows); i += chunkSize {
+		end := i + chunkSize
+		if end > len(rows) {
+			end = len(rows)
+		}
+		chunk := rows[i:end]
+
+		placeholders, args := insertPlaceholders(chunk, cols)
+		stmt := fmt.Sprintf("INSERT INTO public.radio_spot_logs (%s) VALUES %s ON CONFLICT (played_at, log_hash) DO NOTHING",
+			strings.Join(cols, ","), placeholders)
+
+		res, err := db.ExecContext(ctx, stmt, args...)
+		if err != nil {
+			return totalInserted, err
+		}
+		if n, err := res.RowsAffected(); err == nil {
+			totalInserted += int(n)
+		}
+	}
+
+	return totalInserted, nil
+}
+
+// handleStationPlaylistWebhook handles real-time HTTP GET/POST from StationPlaylist Studio
+// Configured in: Studio -> Options -> Now Playing -> Stream Metadata -> HTTP Request
+func (s *server) handleStationPlaylistWebhook(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	artist := q.Get("artist")
+	title := q.Get("title")
+	cat := q.Get("cat")
+	durStr := q.Get("dur")
+	file := q.Get("file")
+	dateStr := q.Get("date")
+	timeStr := q.Get("time")
+	clientParam := q.Get("client")
+	stationStr := q.Get("station")
+
+	stationID := 307
+	if n, err := strconv.Atoi(stationStr); err == nil && n > 0 {
+		stationID = n
+	}
+
+	// Filter: only log if it's an advert or explicitly marked
+	isAdvert := strings.Contains(strings.ToLower(file), "advert") ||
+		strings.Contains(strings.ToLower(title), "advert") ||
+		strings.Contains(strings.ToLower(cat), "spot") ||
+		strings.Contains(strings.ToLower(cat), "commercial")
+
+	if !isAdvert && q.Get("all") != "true" {
+		// Acknowledge without inserting music if not requested
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("IGNORED_NON_ADVERT"))
+		return
+	}
+
+	playedAt := time.Now().In(stationLocation)
+	if dateStr != "" && timeStr != "" {
+		if parsed, err := parseTrafficTimestamp(dateStr + " " + timeStr); err == nil {
+			playedAt = parsed
+		}
+	}
+
+	dur := parseDurationMMSS(durStr)
+	client := resolveTrafficClient(title, file, clientParam)
+	hash := computeTrafficHash(stationID, playedAt, file, title)
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	db, err := s.tsdbDB(ctx)
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": err.Error()})
+		return
+	}
+
+	query := `
+		INSERT INTO public.radio_spot_logs (
+			station_id, played_at, track_type, client, title, artist,
+			duration_seconds, category, filename, log_hash
+		) VALUES ($1, $2, 'Spot', $3, $4, $5, $6, $7, $8, $9)
+		ON CONFLICT (played_at, log_hash) DO NOTHING
+	`
+	_, _ = db.ExecContext(ctx, query, stationID, playedAt, client, title, artist, dur, cat, file, hash)
+
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("OK"))
+}
+
+// handleGetTrafficAdvertisers returns the summary list of advertisers & spot counts
+func (s *server) handleGetTrafficAdvertisers(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	days := atoiDefault(q.Get("days"), 30)
+	station := atoiDefault(q.Get("station"), 307)
+
+	start := time.Now().AddDate(0, 0, -days).Format(time.RFC3339)
+	end := time.Now().Format(time.RFC3339)
+	if sVal := q.Get("start"); sVal != "" {
+		start = sVal
+	}
+	if eVal := q.Get("end"); eVal != "" {
+		end = eVal
+	}
+
+	args := map[string]any{
+		"p_start":   start,
+		"p_end":     end,
+		"p_station": station,
+	}
+	s.callRadioRPC(w, r, "get_traffic_advertiser_summary", []string{"p_start", "p_end", "p_station"}, args)
+}
+
+// handleGetTrafficAffidavit returns itemized proof of performance, supports CSV export
+func (s *server) handleGetTrafficAffidavit(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	client := q.Get("client")
+	days := atoiDefault(q.Get("days"), 30)
+	station := atoiDefault(q.Get("station"), 307)
+	format := strings.ToLower(q.Get("format"))
+
+	start := time.Now().AddDate(0, 0, -days).Format(time.RFC3339)
+	end := time.Now().Format(time.RFC3339)
+	if sVal := q.Get("start"); sVal != "" {
+		start = sVal
+	}
+	if eVal := q.Get("end"); eVal != "" {
+		end = eVal
+	}
+
+	args := map[string]any{
+		"p_client":  client,
+		"p_start":   start,
+		"p_end":     end,
+		"p_station": station,
+	}
+
+	raw := s.callRadioRPCRaw(w, r, "get_traffic_affidavit", []string{"p_client", "p_start", "p_end", "p_station"}, args)
+	if raw == nil {
+		return
+	}
+
+	if format != "csv" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(raw)
+		return
+	}
+
+	// Format as CSV for Traffic Officer / Billing
+	var result struct {
+		Client              string `json:"client"`
+		TotalSpots          int    `json:"total_spots"`
+		TotalAirtimeSeconds int    `json:"total_airtime_seconds"`
+		Spots               []struct {
+			PlayedAtLocal     string `json:"played_at_local"`
+			Client            string `json:"client"`
+			Title             string `json:"title"`
+			DurationFormatted string `json:"duration_formatted"`
+			ProgramName       string `json:"program_name"`
+			UserDJ            string `json:"user_dj"`
+			Filename          string `json:"filename"`
+		} `json:"spots"`
+	}
+
+	if err := json.Unmarshal(raw, &result); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "csv unmarshal: " + err.Error()})
+		return
+	}
+
+	cleanClient := strings.ReplaceAll(client, " ", "_")
+	if cleanClient == "" {
+		cleanClient = "All_Advertisers"
+	}
+
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"Affidavit_%s_%s.csv\"", cleanClient, time.Now().Format("20060102")))
+	w.WriteHeader(http.StatusOK)
+
+	csvW := csv.NewWriter(w)
+	defer csvW.Flush()
+
+	_ = csvW.Write([]string{"SALT FM — PROOF OF PERFORMANCE AFFIDAVIT"})
+	_ = csvW.Write([]string{"Client", result.Client, "Total Spots", strconv.Itoa(result.TotalSpots), "Total Airtime", fmt.Sprintf("%dm %ds", result.TotalAirtimeSeconds/60, result.TotalAirtimeSeconds%60)})
+	_ = csvW.Write([]string{}) // blank line
+	_ = csvW.Write([]string{"Air Date & Time (EAT)", "Client", "Ad Title", "Duration", "Show / Program", "DJ / Playout", "Audio File"})
+
+	for _, sp := range result.Spots {
+		_ = csvW.Write([]string{
+			sp.PlayedAtLocal,
+			sp.Client,
+			sp.Title,
+			sp.DurationFormatted,
+			sp.ProgramName,
+			sp.UserDJ,
+			sp.Filename,
+		})
+	}
+}
+
+// handleUploadTrafficLogFile parses a StationPlaylist SLog-*.csv file directly via multipart POST
+func (s *server) handleUploadTrafficLogFile(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "POST required"})
+		return
+	}
+
+	file, _, err := r.FormFile("file")
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing file form field: " + err.Error()})
+		return
+	}
+	defer file.Close()
+
+	reader := csv.NewReader(file)
+	reader.FieldsPerRecord = -1 // Allow variable columns
+	reader.LazyQuotes = true
+
+	var records []TrafficRecord
+	for {
+		line, rerr := reader.Read()
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil || len(line) < 9 {
+			continue
+		}
+
+		filename := line[8]
+		// Filter: only advert files
+		if !strings.Contains(strings.ToLower(filename), "advert") {
+			continue
+		}
+
+		dateStr := strings.TrimPrefix(line[0], "\ufeff") // strip BOM
+		timeStr := line[1]
+		userDJ := line[2]
+		trackType := line[3]
+		artist := line[4]
+		title := line[5]
+		dur := parseDurationMMSS(line[6])
+		cat := line[7]
+		explicitClient := ""
+		if len(line) > 9 {
+			explicitClient = line[9]
+		}
+		sched := ""
+		if len(line) > 17 {
+			sched = line[17]
+		}
+
+		records = append(records, TrafficRecord{
+			PlayedAt:        dateStr + " " + timeStr,
+			ScheduledAt:     sched,
+			TrackType:       trackType,
+			Client:          explicitClient,
+			Title:           title,
+			Artist:          artist,
+			DurationSeconds: dur,
+			Category:        cat,
+			Filename:        filename,
+			UserDJ:          userDJ,
+		})
+	}
+
+	// Reuse ingestion logic
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	inserted, err := s.insertTrafficRecords(ctx, 307, records)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "insert failed: " + err.Error()})
+		return
+	}
+
+	log.Printf("[Traffic] Uploaded CSV: parsed %d advert records, inserted %d new", len(records), inserted)
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"success":  true,
+		"parsed":   len(records),
+		"inserted": inserted,
+	})
+}

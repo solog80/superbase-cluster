@@ -24,6 +24,8 @@ var allowedRadioTables = map[string]bool{
 	"radio_client":         true,
 	"radio_stream":         true,
 	"radio_listening_time": true,
+	"radio_spot_logs":      true,
+	"traffic_client_rules": true,
 }
 
 // Radio analytics READERS — mirrors functions/src/azuracast.js getRadio*.

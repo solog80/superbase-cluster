@@ -1122,3 +1122,59 @@ User Devices (Web / Mobile / SmartTV) ──► Cloudflare CDN (Attaches CF-Conn
 - **Stream Name Normalization**: Maps `stream` and `app/stream` to **Salt TV One**; `stream2` and `app/stream2` to **Salt TV Two**.
 - **ISO 2-Letter Country Flags**: `getFlagEmoji(code)` renders native flag emojis (e.g., 🇺🇬 Uganda, 🇸🇦 Saudi Arabia, 🇦🇪 UAE, 🇺🇸 USA) alongside country names.
 - **Card Alignment**: Filters out duplicate path alias keys to keep the primary Live Viewers StatCard perfectly aligned with the Live Streams breakdown.
+
+---
+
+## 23. StationPlaylist FM Traffic & Advertiser Ingestion Pipeline (Oct 2026) ✅
+
+### 23.1 Executive Overview & Architecture
+Automates commercial spot reconciliation and client billing affidavits for **Salt FM (307)**. Replaces daily manual Excel log extraction from the playout PC (`AIR-PC`) with automated real-time ingestion into TimescaleDB on QNAP (`ug` / `nas-ts`).
+
+```text
+[StationPlaylist Studio @ Playout PC (AIR-PC)]
+        │
+        ├─ Flushes daily CSV: C:\StationPlaylist\Logs\SLog-YYMMDD.csv
+        │
+[StationPlaylist Traffic Agent] (myApps/stationplaylist-agent-windows)
+        │
+        ├─ Tails active log in real-time
+        ├─ Filters commercial spots (e.g. F:\Adverts\...)
+        ├─ In-flight client resolution (MTN, Minute Maid, Airtel, Plascon, etc.)
+        ├─ Local state watermark (.spl_agent_state.json) survives power/net cuts
+        │
+        ▼ HTTPS POST /api/v1/ingestTrafficLogs
+  Salt Mesh API (edge.solofx.net)
+        ▼ Tailscale (100.116.185.70:55439)
+  TimescaleDB on QNAP (analytics DB)
+        │
+        ├── public.radio_spot_logs (hypertable on played_at)
+        ├── public.traffic_client_rules
+        │
+        ▼ Traffic Officer Pull / Billing
+  GET /api/v1/getTrafficAdvertisers
+  GET /api/v1/getTrafficAffidavit?client=MTN&format=csv
+```
+
+### 23.2 Components & Implementation
+1. **TimescaleDB on QNAP (`ug` node, `100.116.185.70:55439`, db: `analytics`)**:
+   - Migration: `migrations/tsdb_009_stationplaylist_traffic.sql` (deployed).
+   - Hypertable: `public.radio_spot_logs` partitioned on `played_at`.
+   - Deduplication: Unique index on `(played_at, log_hash)` guarantees zero duplicate records even if logs are re-scanned.
+   - Client Mapping: `public.traffic_client_rules` allows managing client alias regex patterns directly from Postgres without redeploying code.
+   - Functions: `get_traffic_advertiser_summary`, `get_traffic_affidavit`, `get_traffic_clients`, `resolve_traffic_client`.
+
+2. **Go Mesh Service (`salt-gofn` inside `supabase-api` on `Edge`)**:
+   - Source: `gofn/traffic.go` (deployed to Edge).
+   - High-speed multi-row bulk batching (`insertTrafficRecords`) executing over Tailscale in <500ms.
+   - Endpoints:
+     - `POST /api/v1/ingestTrafficLogs`: JSON batch ingestion from Windows Agent.
+     - `GET/POST /api/v1/stationPlaylistWebhook`: Native Studio Now Playing HTTP stream.
+     - `POST /api/v1/uploadTrafficLogFile`: Multi-part CSV file upload.
+     - `GET /api/v1/getTrafficAdvertisers`: Summary query for dashboard.
+     - `GET /api/v1/getTrafficAffidavit`: Certified Proof of Performance with CSV download (`?format=csv`).
+
+3. **Playout PC Agent (`myApps/stationplaylist-agent-windows`)**:
+   - Standalone Go binary: `dist/StationPlaylistTrafficAgent.exe` (Windows x64).
+   - Pre-built distribution zip: `StationPlaylist.TrafficAgent-win-x64.zip`.
+   - Zero-install fallback: `scripts/StationPlaylist-TrafficSync.ps1` for Task Scheduler.
+   - Verified live: Ingested 120 advert plays from `SLog-261014.csv` with 100% accuracy.

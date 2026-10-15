@@ -268,6 +268,16 @@ func (s *server) dispatch(w http.ResponseWriter, r *http.Request) {
 		s.handleGetRadioShowSnapshots(w, r)
 	case "getRadioShowListenerDetails":
 		s.handleGetRadioShowListenerDetails(w, r)
+	case "ingestTrafficLogs":
+		s.handleIngestTrafficLogs(w, r)
+	case "stationPlaylistWebhook":
+		s.handleStationPlaylistWebhook(w, r)
+	case "getTrafficAdvertisers":
+		s.handleGetTrafficAdvertisers(w, r)
+	case "getTrafficAffidavit":
+		s.handleGetTrafficAffidavit(w, r)
+	case "uploadTrafficLogFile":
+		s.handleUploadTrafficLogFile(w, r)
 	case "getAdminAnalytics":
 		if !s.isServiceKey(r) {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"success": false, "error": "Unauthorized: Admin access required"})
@@ -439,6 +449,11 @@ func (s *server) publicFn(name string) bool {
 		"getRadioShowAnalytics",
 		"getRadioShowSnapshots",
 		"getRadioShowListenerDetails",
+		"ingestTrafficLogs",
+		"stationPlaylistWebhook",
+		"getTrafficAdvertisers",
+		"getTrafficAffidavit",
+		"uploadTrafficLogFile",
 		"syncAzuraCastHistory",
 		"syncAzuraCastReports",
 		"snapshotAzuraCastListenersManual",
