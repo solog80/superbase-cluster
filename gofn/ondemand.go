@@ -114,6 +114,8 @@ func episodeJSON(e odEpisode) map[string]any {
 		"published":   e.Published,
 		"processing":  e.Processing,
 		"sfxJobName":  orEmpty(e.SfxJobName),
+		"server":      orEmpty(e.Server),
+		"bunnyGuid":   orEmpty(e.BunnyGUID),
 	}
 }
 

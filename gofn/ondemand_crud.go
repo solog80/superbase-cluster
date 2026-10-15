@@ -523,6 +523,14 @@ func (s *server) handleCreateSfxEpisode(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 	case body.SeasonTitle != "":
+		// If a season with this title already exists for this show, reuse it.
+		if raw, _, err := s.doRest(ctx, "seasons", url.Values{"select": {"id"}, "show_id": {"eq." + url.QueryEscape(body.ShowID)}, "title": {"eq." + url.QueryEscape(body.SeasonTitle)}, "limit": {"1"}}); err == nil {
+			var rows []struct{ ID string `json:"id"` }
+			if json.Unmarshal(raw, &rows) == nil && len(rows) == 1 {
+				seasonID = rows[0].ID
+				break
+			}
+		}
 		var nextOrder int = 1
 		if raw, _, err := s.doRest(ctx, "seasons", url.Values{"select": {"ord"}, "show_id": {"eq." + url.QueryEscape(body.ShowID)}, "order": {"ord.desc"}, "limit": {"1"}}); err == nil {
 			var rows []struct{ Ord int `json:"ord"` }

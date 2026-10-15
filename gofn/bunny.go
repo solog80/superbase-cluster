@@ -1,10 +1,16 @@
 package main
 
 import (
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"time"
 )
@@ -74,3 +80,125 @@ func fetchBunnyVideo(client *http.Client, videoID string) (*bunnyVideo, error) {
 	}
 	return nil, fmt.Errorf("bunny video %s not found", videoID)
 }
+
+// handleBunnyWebhook processes asynchronous video status updates from Bunny Stream webhooks.
+// Payload: { "VideoLibraryId": 307069, "VideoGuid": "...", "Status": 3 }
+// Status list: 0=Queued, 1=Processing, 2=Encoding, 3=Finished, 4=Resolution finished, 5=Failed.
+func (s *server) handleBunnyWebhook(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+		return
+	}
+
+	bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "failed to read body"})
+		return
+	}
+
+	// Signature verification (HMAC-SHA256 with library Read-Only API key if configured)
+	if secret := os.Getenv("BUNNY_WEBHOOK_KEY"); secret != "" {
+		sig := r.Header.Get("X-BunnyStream-Signature")
+		mac := hmac.New(sha256.New, []byte(secret))
+		mac.Write(bodyBytes)
+		expected := hex.EncodeToString(mac.Sum(nil))
+		if !hmac.Equal([]byte(sig), []byte(expected)) {
+			log.Printf("[bunnyWebhook] Signature mismatch: got %s, expected %s", sig, expected)
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "invalid signature"})
+			return
+		}
+	}
+
+	var payload struct {
+		VideoLibraryID int    `json:"VideoLibraryId"`
+		VideoGUID      string `json:"VideoGuid"`
+		Status         int    `json:"Status"`
+	}
+	if err := json.Unmarshal(bodyBytes, &payload); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid json"})
+		return
+	}
+
+	if payload.VideoGUID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing VideoGuid"})
+		return
+	}
+
+	log.Printf("[bunnyWebhook] Event received for video %s: status=%d (library=%d)", payload.VideoGUID, payload.Status, payload.VideoLibraryID)
+
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	switch payload.Status {
+	case 3, 4:
+		// Video Finished (3) or Resolution finished (4 - playable)
+		v, err := fetchBunnyVideo(s.client, payload.VideoGUID)
+		if err != nil {
+			log.Printf("[bunnyWebhook] Failed to fetch video %s from Bunny: %v", payload.VideoGUID, err)
+			writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
+			return
+		}
+
+		host := bunnyCDNHostname()
+		if v.Hostname != "" {
+			host = v.Hostname
+		}
+		thumbFile := v.ThumbnailFileName
+		if thumbFile == "" {
+			thumbFile = "thumbnail.jpg"
+		}
+		thumbURL := fmt.Sprintf("https://%s/%s/%s", host, v.GUID, thumbFile)
+		videoURL := fmt.Sprintf("https://%s/%s/playlist.m3u8", host, v.GUID)
+
+		patch := map[string]any{
+			"processing": false,
+			"duration":   int(v.Length),
+			"thumbnail":  thumbURL,
+			"video_url":  videoURL,
+			"updated_at": now,
+		}
+
+		// Try updating by bunny_guid first
+		affected, err := s.restPatchCount(ctx, "episodes", "bunny_guid=eq."+url.QueryEscape(payload.VideoGUID), patch)
+		if err != nil || affected == 0 {
+			// Fallback: match by video_url containing the guid
+			affected, err = s.restPatchCount(ctx, "episodes", "video_url=like.*"+url.QueryEscape(payload.VideoGUID)+"*", patch)
+		}
+
+		s.clearOndemandCache()
+		log.Printf("[bunnyWebhook] Video %s updated in DB: duration=%vs, rows_updated=%d", payload.VideoGUID, v.Length, affected)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"success":     true,
+			"videoGuid":   payload.VideoGUID,
+			"status":      payload.Status,
+			"duration":    v.Length,
+			"rowsUpdated": affected,
+		})
+		return
+
+	case 5:
+		// Failed
+		patch := map[string]any{
+			"processing": false,
+			"updated_at": now,
+		}
+		affected, _ := s.restPatchCount(ctx, "episodes", "bunny_guid=eq."+url.QueryEscape(payload.VideoGUID), patch)
+		s.clearOndemandCache()
+		log.Printf("[bunnyWebhook] Video %s failed transcoding: rows_updated=%d", payload.VideoGUID, affected)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"success":     true,
+			"videoGuid":   payload.VideoGUID,
+			"status":      "failed",
+			"rowsUpdated": affected,
+		})
+		return
+
+	default:
+		// 0=Queued, 1=Processing, 2=Encoding, 6/7/8=Upload states, etc.
+		writeJSON(w, http.StatusOK, map[string]any{"success": true, "status": payload.Status})
+		return
+	}
+}
+

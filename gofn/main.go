@@ -355,7 +355,7 @@ func (s *server) dispatch(w http.ResponseWriter, r *http.Request) {
 			s.handleDeleteEvent(w, r)
 		}
 	case "getOnDemandData", "getOnDemandShowById", "getOnDemandSeasonEpisodes",
-		"getPublicOnDemandData", "ondemandHealthCheck", "getSignedPlaylist":
+		"getPublicOnDemandData", "ondemandHealthCheck", "getSignedPlaylist", "bunnyWebhook":
 		switch name {
 		case "getOnDemandData":
 			s.handleGetOnDemandData(w, r)
@@ -369,6 +369,8 @@ func (s *server) dispatch(w http.ResponseWriter, r *http.Request) {
 			s.handleGetSignedPlaylist(w, r)
 		case "ondemandHealthCheck":
 			s.handleOndemandHealthCheck(w, r)
+		case "bunnyWebhook":
+			s.handleBunnyWebhook(w, r)
 		}
 	case "createOnDemandShow", "updateOnDemandShow", "deleteOnDemandShow",
 		"createOnDemandSeason", "updateOnDemandSeason", "deleteOnDemandSeason",
@@ -450,7 +452,8 @@ func (s *server) publicFn(name string) bool {
 		"getOnDemandSeasonEpisodes",
 		"getPublicOnDemandData",
 		"getSignedPlaylist",
-		"ondemandHealthCheck":
+		"ondemandHealthCheck",
+		"bunnyWebhook":
 		return true
 	}
 	return false
