@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // stationLocation is Salt FM / Kampala timezone (UTC+3)
@@ -24,13 +25,13 @@ type TrafficRecord struct {
 	PlayedAt        string `json:"played_at"`        // "14/10/2026 08:16:41" or RFC3339
 	ScheduledAt     string `json:"scheduled_at"`     // "13/10/2026 23:00" or RFC3339
 	TrackType       string `json:"track_type"`       // "Spot", "Manual", etc.
-	Client          string `json:"client"`          // Advertiser / Sponsor name
-	Title           string `json:"title"`           // Ad copy title
-	Artist          string `json:"artist"`          // Campaign / artist
+	Client          string `json:"client"`           // Advertiser / Sponsor name
+	Title           string `json:"title"`            // Ad copy title
+	Artist          string `json:"artist"`           // Campaign / artist
 	DurationSeconds int    `json:"duration_seconds"` // Airtime in seconds
-	Category        string `json:"category"`        // Category / Spot Group
-	Filename        string `json:"filename"`        // Playout path e.g. F:\Adverts\...
-	UserDJ          string `json:"user_dj"`         // Playout user/presenter
+	Category        string `json:"category"`         // Category / Spot Group
+	Filename        string `json:"filename"`         // Playout path e.g. F:\Adverts\...
+	UserDJ          string `json:"user_dj"`          // Playout user/presenter
 	Listeners       int    `json:"listeners"`
 }
 
@@ -39,11 +40,15 @@ type trafficIngestRequest struct {
 	Records   []TrafficRecord `json:"records"`
 }
 
-// defaultClientPatterns maps common audio filenames & titles to advertisers
-var defaultClientPatterns = []struct {
+// clientRule maps a filename/title pattern to an advertiser name.
+type clientRule struct {
 	client  string
 	pattern *regexp.Regexp
-}{
+}
+
+// defaultClientPatterns is the built-in fallback used when the DB rule table
+// (public.traffic_client_rules) is unreachable. DB rules take precedence.
+var defaultClientPatterns = []clientRule{
 	{"Minute Maid", regexp.MustCompile(`(?i)MINUTE\s*MAID`)},
 	{"MTN", regexp.MustCompile(`(?i)\bMTN\b`)},
 	{"Airtel", regexp.MustCompile(`(?i)\bAIRTEL\b`)},
@@ -58,18 +63,146 @@ var defaultClientPatterns = []struct {
 	{"Sky View", regexp.MustCompile(`(?i)SKY\s*VIEW`)},
 	{"Salt Media (House Promo)", regexp.MustCompile(`(?i)SALT\s*(MEDIA|APP|LUG\s*APP|ENG\s*APP)`)},
 	{"Health Tip (Sponsored)", regexp.MustCompile(`(?i)HEALTH\s*TIP`)},
+	{"UPPC", regexp.MustCompile(`(?i)\bUPPC\b`)},
 }
 
-// resolveTrafficClient infers the advertiser if Client column is empty in manual logs
-func resolveTrafficClient(title, filename, explicit string) string {
+// trafficRulesTTL controls how long the DB-backed advertiser rules are cached.
+const trafficRulesTTL = 5 * time.Minute
+
+// loadClientRules returns advertiser match rules, preferring the DB table and
+// falling back to last-known-good / the built-in list when unavailable.
+func (s *server) loadClientRules(ctx context.Context) []clientRule {
+	s.trafficRulesMu.Lock()
+	defer s.trafficRulesMu.Unlock()
+
+	if s.trafficRules != nil && time.Now().Before(s.trafficRulesExpiry) {
+		return s.trafficRules
+	}
+
+	rules, err := s.fetchClientRules(ctx)
+	if err != nil || len(rules) == 0 {
+		if len(s.trafficRules) > 0 {
+			return s.trafficRules // keep last-known-good
+		}
+		return defaultClientPatterns
+	}
+
+	s.trafficRules = rules
+	s.trafficRulesExpiry = time.Now().Add(trafficRulesTTL)
+	return rules
+}
+
+// fetchClientRules reads and compiles public.traffic_client_rules from TimescaleDB.
+func (s *server) fetchClientRules(ctx context.Context) ([]clientRule, error) {
+	db, err := s.tsdbDB(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := db.QueryContext(ctx, `
+		SELECT client_name, match_pattern
+		FROM public.traffic_client_rules
+		ORDER BY priority DESC, id ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var rules []clientRule
+	for rows.Next() {
+		var name, pattern string
+		if err := rows.Scan(&name, &pattern); err != nil {
+			continue
+		}
+		name = strings.TrimSpace(name)
+		pattern = strings.TrimSpace(pattern)
+		if name == "" || pattern == "" {
+			continue
+		}
+		re, cerr := regexp.Compile("(?i)" + pattern)
+		if cerr != nil {
+			log.Printf("[Traffic] skipping invalid client rule %q: %v", pattern, cerr)
+			continue
+		}
+		rules = append(rules, clientRule{client: name, pattern: re})
+	}
+	return rules, rows.Err()
+}
+
+// nonClientPrefixes are generic words that must not be treated as an advertiser
+// when parsing the studio "Client - Ad Name.mp3" naming convention.
+var nonClientPrefixes = map[string]bool{
+	"ad": true, "ads": true, "advert": true, "adverts": true, "advertisement": true,
+	"jingle": true, "promo": true, "spot": true, "commercial": true, "sting": true,
+	"announcement": true, "audio": true, "voice": true, "track": true,
+}
+
+// clientFromFilename derives the advertiser from the studio naming convention
+// "Client - Ad Name.mp3" (advertiser = text before the first " - "). Returns ""
+// when the prefix is absent or not a plausible name.
+func clientFromFilename(filename string, rules []clientRule) string {
+	if filename == "" {
+		return ""
+	}
+	base := filename
+	if i := strings.LastIndexAny(base, `\/`); i >= 0 {
+		base = base[i+1:]
+	}
+	base = strings.TrimSpace(base)
+	for _, ext := range []string{".mpeg.mp3", ".mp3.mpeg", ".mp3", ".mpeg", ".wav", ".mp4", ".aac", ".m4a", ".ogg"} {
+		if strings.HasSuffix(strings.ToLower(base), ext) {
+			base = strings.TrimSpace(base[:len(base)-len(ext)])
+		}
+	}
+
+	idx := strings.Index(base, " - ")
+	if idx <= 0 {
+		return ""
+	}
+	name := strings.TrimSpace(base[:idx])
+	if !isPlausibleClient(name) {
+		return ""
+	}
+	// Prefer the canonical spelling when this prefix is a known advertiser.
+	for _, r := range rules {
+		if strings.EqualFold(r.client, name) {
+			return r.client
+		}
+	}
+	return name
+}
+
+func isPlausibleClient(name string) bool {
+	if len(name) < 2 || len(name) > 40 {
+		return false
+	}
+	if nonClientPrefixes[strings.ToLower(name)] {
+		return false
+	}
+	for _, r := range name {
+		if unicode.IsLetter(r) {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveTrafficClient infers the advertiser when the Client column is empty in
+// manual logs. Precedence: explicit client → DB-driven rules →
+// filename "Client - Ad Name" prefix → "Other Advert" / "Unassigned".
+func (s *server) resolveTrafficClient(ctx context.Context, title, filename, explicit string) string {
 	if strings.TrimSpace(explicit) != "" {
 		return strings.TrimSpace(explicit)
 	}
+	rules := s.loadClientRules(ctx)
 	target := title + " " + filename
-	for _, p := range defaultClientPatterns {
+	for _, p := range rules {
 		if p.pattern.MatchString(target) {
 			return p.client
 		}
+	}
+	if c := clientFromFilename(filename, rules); c != "" {
+		return c
 	}
 	if strings.Contains(strings.ToLower(filename), "advert") || strings.Contains(strings.ToLower(title), "advert") {
 		return "Other Advert"
@@ -203,7 +336,7 @@ func (s *server) insertTrafficRecords(ctx context.Context, stationID int, record
 			}
 		}
 
-		client := resolveTrafficClient(rec.Title, rec.Filename, rec.Client)
+		client := s.resolveTrafficClient(ctx, rec.Title, rec.Filename, rec.Client)
 		trackType := rec.TrackType
 		if trackType == "" || trackType == "0" {
 			trackType = "Spot"
@@ -303,11 +436,12 @@ func (s *server) handleStationPlaylistWebhook(w http.ResponseWriter, r *http.Req
 	}
 
 	dur := parseDurationMMSS(durStr)
-	client := resolveTrafficClient(title, file, clientParam)
 	hash := computeTrafficHash(stationID, playedAt, file, title)
 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
+
+	client := s.resolveTrafficClient(ctx, title, file, clientParam)
 
 	db, err := s.tsdbDB(ctx)
 	if err != nil {

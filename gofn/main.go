@@ -39,6 +39,10 @@ type server struct {
 	rpcMu    sync.Mutex
 	rpcCache map[string]rpcCacheEntry
 
+	trafficRulesMu     sync.Mutex
+	trafficRules       []clientRule
+	trafficRulesExpiry time.Time
+
 	epgMu    sync.Mutex
 	epgCache map[string]epgCacheEntry
 
@@ -53,8 +57,8 @@ type server struct {
 	broadcastMu sync.Mutex
 
 	// SMS agent (TV-station Windows gateway) auth + outbox polling window.
-	smsAgentKey  string
-	waAppSecret  string
+	smsAgentKey   string
+	waAppSecret   string
 	waVerifyToken string
 	waSystemToken string
 }
@@ -88,10 +92,10 @@ func main() {
 		odCache:      nil,
 		odThumbCache: map[string]string{},
 
-		smsAgentKey:    os.Getenv("SMS_AGENT_KEY"),
-		waAppSecret:    os.Getenv("WA_APP_SECRET"),
-		waVerifyToken:  os.Getenv("WA_VERIFY_TOKEN"),
-		waSystemToken:  os.Getenv("WA_SYSTEM_USER_TOKEN"),
+		smsAgentKey:   os.Getenv("SMS_AGENT_KEY"),
+		waAppSecret:   os.Getenv("WA_APP_SECRET"),
+		waVerifyToken: os.Getenv("WA_VERIFY_TOKEN"),
+		waSystemToken: os.Getenv("WA_SYSTEM_USER_TOKEN"),
 	}
 	if s.osURL != "" {
 		tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: s.osInsecure}}
