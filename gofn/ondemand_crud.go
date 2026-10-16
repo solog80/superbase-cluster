@@ -157,7 +157,7 @@ func (s *server) handleCreateOnDemandSeason(w http.ResponseWriter, r *http.Reque
 
 	// Resolve the show title for slugging.
 	var showTitle string
-	if raw, _, err := s.doRest(ctx, "tv_shows", url.Values{"select": {"title"}, "id": {"eq." + url.QueryEscape(body.ShowID)}}); err == nil {
+	if raw, _, err := s.doRest(ctx, "tv_shows", url.Values{"select": {"title"}, "id": {"eq." + body.ShowID}}); err == nil {
 		var rows []struct{ Title string `json:"title"` }
 		if json.Unmarshal(raw, &rows) == nil && len(rows) == 1 {
 			showTitle = rows[0].Title
@@ -167,7 +167,7 @@ func (s *server) handleCreateOnDemandSeason(w http.ResponseWriter, r *http.Reque
 	seasonOrder := body.Order
 	if seasonOrder == 0 {
 		// next season order = max(ord) + 1
-		if raw, _, err := s.doRest(ctx, "seasons", url.Values{"select": {"ord"}, "show_id": {"eq." + url.QueryEscape(body.ShowID)}, "order": {"ord.desc"}, "limit": {"1"}}); err == nil {
+		if raw, _, err := s.doRest(ctx, "seasons", url.Values{"select": {"ord"}, "show_id": {"eq." + body.ShowID}, "order": {"ord.desc"}, "limit": {"1"}}); err == nil {
 			var rows []struct {
 				Ord int `json:"ord"`
 			}
@@ -197,7 +197,7 @@ func (s *server) handleCreateOnDemandSeason(w http.ResponseWriter, r *http.Reque
 	}
 
 	// Bump the show's seasonCount.
-	if raw, _, err := s.doRest(ctx, "seasons", url.Values{"select": {"id"}, "show_id": {"eq." + url.QueryEscape(body.ShowID)}}); err == nil {
+	if raw, _, err := s.doRest(ctx, "seasons", url.Values{"select": {"id"}, "show_id": {"eq." + body.ShowID}}); err == nil {
 		var rows []struct{ ID string `json:"id"` }
 		if json.Unmarshal(raw, &rows) == nil {
 			_ = s.restPatch(ctx, "tv_shows", "id=eq."+url.QueryEscape(body.ShowID), map[string]any{"season_count": len(rows), "updated_at": now})
@@ -285,7 +285,7 @@ func (s *server) handleDeleteOnDemandSeason(w http.ResponseWriter, r *http.Reque
 	}
 
 	// Recompute show seasonCount.
-	if raw, _, err := s.doRest(ctx, "seasons", url.Values{"select": {"id"}, "show_id": {"eq." + url.QueryEscape(body.ShowID)}}); err == nil {
+	if raw, _, err := s.doRest(ctx, "seasons", url.Values{"select": {"id"}, "show_id": {"eq." + body.ShowID}}); err == nil {
 		var rows []struct{ ID string `json:"id"` }
 		if json.Unmarshal(raw, &rows) == nil {
 			_ = s.restPatch(ctx, "tv_shows", "id=eq."+url.QueryEscape(body.ShowID), map[string]any{"season_count": len(rows), "updated_at": time.Now().UTC().Format(time.RFC3339)})
@@ -377,7 +377,7 @@ func (s *server) handleDeleteOnDemandEpisode(w http.ResponseWriter, r *http.Requ
 	}
 
 	// Recompute season episodeCount.
-	if raw, _, err := s.doRest(ctx, "episodes", url.Values{"select": {"id"}, "season_id": {"eq." + url.QueryEscape(body.SeasonID)}}); err == nil {
+	if raw, _, err := s.doRest(ctx, "episodes", url.Values{"select": {"id"}, "season_id": {"eq." + body.SeasonID}}); err == nil {
 		var rows []struct{ ID string `json:"id"` }
 		if json.Unmarshal(raw, &rows) == nil {
 			_ = s.restPatch(ctx, "seasons", "id=eq."+url.QueryEscape(body.SeasonID), map[string]any{"episode_count": len(rows), "updated_at": time.Now().UTC().Format(time.RFC3339)})
@@ -477,7 +477,7 @@ func (s *server) handleCreateSfxEpisode(w http.ResponseWriter, r *http.Request) 
 
 	// Resolve show slug for ID generation.
 	showSlug := generateSlug(body.ShowID)
-	if raw, _, err := s.doRest(ctx, "tv_shows", url.Values{"select": {"title"}, "id": {"eq." + url.QueryEscape(body.ShowID)}}); err == nil {
+	if raw, _, err := s.doRest(ctx, "tv_shows", url.Values{"select": {"title"}, "id": {"eq." + body.ShowID}}); err == nil {
 		var rows []struct{ Title string `json:"title"` }
 		if json.Unmarshal(raw, &rows) == nil && len(rows) == 1 {
 			showSlug = generateSlug(rows[0].Title)
@@ -495,7 +495,7 @@ func (s *server) handleCreateSfxEpisode(w http.ResponseWriter, r *http.Request) 
 		// the Firestore side may have created the season in Firestore only, and
 		// blindly inserting the episode would violate the seasons FK (500).
 		seasonID = body.SeasonID
-		if raw, _, err := s.doRest(ctx, "seasons", url.Values{"select": {"id"}, "id": {"eq." + url.QueryEscape(seasonID)}}); err == nil {
+		if raw, _, err := s.doRest(ctx, "seasons", url.Values{"select": {"id"}, "id": {"eq." + seasonID}}); err == nil {
 			var rows []struct{ ID string `json:"id"` }
 			if json.Unmarshal(raw, &rows) == nil && len(rows) == 1 {
 				// exists — reuse
@@ -507,7 +507,7 @@ func (s *server) handleCreateSfxEpisode(w http.ResponseWriter, r *http.Request) 
 			title = seasonID
 		}
 		var nextOrder int = 1
-		if raw, _, err := s.doRest(ctx, "seasons", url.Values{"select": {"ord"}, "show_id": {"eq." + url.QueryEscape(body.ShowID)}, "order": {"ord.desc"}, "limit": {"1"}}); err == nil {
+		if raw, _, err := s.doRest(ctx, "seasons", url.Values{"select": {"ord"}, "show_id": {"eq." + body.ShowID}, "order": {"ord.desc"}, "limit": {"1"}}); err == nil {
 			var rows []struct{ Ord int `json:"ord"` }
 			if json.Unmarshal(raw, &rows) == nil && len(rows) == 1 {
 				nextOrder = rows[0].Ord + 1
@@ -524,7 +524,7 @@ func (s *server) handleCreateSfxEpisode(w http.ResponseWriter, r *http.Request) 
 		}
 	case body.SeasonTitle != "":
 		// If a season with this title already exists for this show, reuse it.
-		if raw, _, err := s.doRest(ctx, "seasons", url.Values{"select": {"id"}, "show_id": {"eq." + url.QueryEscape(body.ShowID)}, "title": {"eq." + url.QueryEscape(body.SeasonTitle)}, "limit": {"1"}}); err == nil {
+		if raw, _, err := s.doRest(ctx, "seasons", url.Values{"select": {"id"}, "show_id": {"eq." + body.ShowID}, "title": {"eq." + body.SeasonTitle}, "limit": {"1"}}); err == nil {
 			var rows []struct{ ID string `json:"id"` }
 			if json.Unmarshal(raw, &rows) == nil && len(rows) == 1 {
 				seasonID = rows[0].ID
@@ -532,7 +532,7 @@ func (s *server) handleCreateSfxEpisode(w http.ResponseWriter, r *http.Request) 
 			}
 		}
 		var nextOrder int = 1
-		if raw, _, err := s.doRest(ctx, "seasons", url.Values{"select": {"ord"}, "show_id": {"eq." + url.QueryEscape(body.ShowID)}, "order": {"ord.desc"}, "limit": {"1"}}); err == nil {
+		if raw, _, err := s.doRest(ctx, "seasons", url.Values{"select": {"ord"}, "show_id": {"eq." + body.ShowID}, "order": {"ord.desc"}, "limit": {"1"}}); err == nil {
 			var rows []struct{ Ord int `json:"ord"` }
 			if json.Unmarshal(raw, &rows) == nil && len(rows) == 1 {
 				nextOrder = rows[0].Ord + 1
@@ -550,7 +550,7 @@ func (s *server) handleCreateSfxEpisode(w http.ResponseWriter, r *http.Request) 
 		}
 	default:
 		// Use the first season (lowest ord), else create "Season 1".
-		if raw, _, err := s.doRest(ctx, "seasons", url.Values{"select": {"id"}, "show_id": {"eq." + url.QueryEscape(body.ShowID)}, "order": {"ord.asc"}, "limit": {"1"}}); err == nil {
+		if raw, _, err := s.doRest(ctx, "seasons", url.Values{"select": {"id"}, "show_id": {"eq." + body.ShowID}, "order": {"ord.asc"}, "limit": {"1"}}); err == nil {
 			var rows []struct{ ID string `json:"id"` }
 			if json.Unmarshal(raw, &rows) == nil && len(rows) == 1 {
 				seasonID = rows[0].ID
@@ -574,7 +574,7 @@ func (s *server) handleCreateSfxEpisode(w http.ResponseWriter, r *http.Request) 
 	// created ep02 while ep01 is absent), so take the max existing _epNN suffix
 	// + 1 instead of counting rows.
 	episodeNum := 1
-	if raw, _, err := s.doRest(ctx, "episodes", url.Values{"select": {"id"}, "season_id": {"eq." + url.QueryEscape(seasonID)}}); err == nil {
+	if raw, _, err := s.doRest(ctx, "episodes", url.Values{"select": {"id"}, "season_id": {"eq." + seasonID}}); err == nil {
 		var rows []struct{ ID string `json:"id"` }
 		if json.Unmarshal(raw, &rows) == nil {
 			maxNum := 0
@@ -615,7 +615,7 @@ func (s *server) handleCreateSfxEpisode(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Update season episodeCount.
-	if raw, _, err := s.doRest(ctx, "episodes", url.Values{"select": {"id"}, "season_id": {"eq." + url.QueryEscape(seasonID)}}); err == nil {
+	if raw, _, err := s.doRest(ctx, "episodes", url.Values{"select": {"id"}, "season_id": {"eq." + seasonID}}); err == nil {
 		var rows []struct{ ID string `json:"id"` }
 		if json.Unmarshal(raw, &rows) == nil {
 			_ = s.restPatch(ctx, "seasons", "id=eq."+url.QueryEscape(seasonID), map[string]any{"episode_count": len(rows), "updated_at": now})
