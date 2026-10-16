@@ -43,6 +43,10 @@ type server struct {
 	trafficRules       []clientRule
 	trafficRulesExpiry time.Time
 
+	titleOverridesMu     sync.Mutex
+	titleOverrides       []titleOverride
+	titleOverridesExpiry time.Time
+
 	epgMu    sync.Mutex
 	epgCache map[string]epgCacheEntry
 

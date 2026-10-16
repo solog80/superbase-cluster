@@ -129,6 +129,80 @@ func (s *server) fetchClientRules(ctx context.Context) ([]clientRule, error) {
 	return rules, rows.Err()
 }
 
+// titleOverride maps a title/filename pattern to a corrected creative title.
+type titleOverride struct {
+	title   string
+	pattern *regexp.Regexp
+}
+
+// loadTitleOverrides returns per-creative title overrides, cached like the rules.
+func (s *server) loadTitleOverrides(ctx context.Context) []titleOverride {
+	s.titleOverridesMu.Lock()
+	defer s.titleOverridesMu.Unlock()
+
+	if s.titleOverrides != nil && time.Now().Before(s.titleOverridesExpiry) {
+		return s.titleOverrides
+	}
+
+	overrides, err := s.fetchTitleOverrides(ctx)
+	if err != nil {
+		return s.titleOverrides // keep last-known-good (may be nil)
+	}
+
+	s.titleOverrides = overrides
+	s.titleOverridesExpiry = time.Now().Add(trafficRulesTTL)
+	return overrides
+}
+
+// fetchTitleOverrides reads and compiles public.traffic_title_overrides.
+func (s *server) fetchTitleOverrides(ctx context.Context) ([]titleOverride, error) {
+	db, err := s.tsdbDB(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := db.QueryContext(ctx, `
+		SELECT match_pattern, title_override
+		FROM public.traffic_title_overrides
+		ORDER BY priority DESC, id ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var overrides []titleOverride
+	for rows.Next() {
+		var title, pattern string
+		if err := rows.Scan(&pattern, &title); err != nil {
+			continue
+		}
+		title = strings.TrimSpace(title)
+		pattern = strings.TrimSpace(pattern)
+		if title == "" || pattern == "" {
+			continue
+		}
+		re, cerr := regexp.Compile("(?i)" + pattern)
+		if cerr != nil {
+			log.Printf("[Traffic] skipping invalid title override %q: %v", pattern, cerr)
+			continue
+		}
+		overrides = append(overrides, titleOverride{title: title, pattern: re})
+	}
+	return overrides, rows.Err()
+}
+
+// resolveTrafficTitle applies any per-creative title override, else returns the
+// original StationPlaylist title.
+func (s *server) resolveTrafficTitle(ctx context.Context, title, filename string) string {
+	target := title + " " + filename
+	for _, o := range s.loadTitleOverrides(ctx) {
+		if o.pattern.MatchString(target) {
+			return o.title
+		}
+	}
+	return title
+}
+
 // nonClientPrefixes are generic words that must not be treated as an advertiser
 // when parsing the studio "Client - Ad Name.mp3" naming convention.
 var nonClientPrefixes = map[string]bool{
@@ -337,6 +411,7 @@ func (s *server) insertTrafficRecords(ctx context.Context, stationID int, record
 		}
 
 		client := s.resolveTrafficClient(ctx, rec.Title, rec.Filename, rec.Client)
+		title := s.resolveTrafficTitle(ctx, rec.Title, rec.Filename)
 		trackType := rec.TrackType
 		if trackType == "" || trackType == "0" {
 			trackType = "Spot"
@@ -349,7 +424,7 @@ func (s *server) insertTrafficRecords(ctx context.Context, stationID int, record
 			"scheduled_at":     schedAt,
 			"track_type":       trackType,
 			"client":           client,
-			"title":            rec.Title,
+			"title":            title,
 			"artist":           rec.Artist,
 			"duration_seconds": rec.DurationSeconds,
 			"category":         rec.Category,
@@ -442,6 +517,7 @@ func (s *server) handleStationPlaylistWebhook(w http.ResponseWriter, r *http.Req
 	defer cancel()
 
 	client := s.resolveTrafficClient(ctx, title, file, clientParam)
+	storedTitle := s.resolveTrafficTitle(ctx, title, file)
 
 	db, err := s.tsdbDB(ctx)
 	if err != nil {
@@ -456,7 +532,7 @@ func (s *server) handleStationPlaylistWebhook(w http.ResponseWriter, r *http.Req
 		) VALUES ($1, $2, 'Spot', $3, $4, $5, $6, $7, $8, $9)
 		ON CONFLICT (played_at, log_hash) DO NOTHING
 	`
-	_, _ = db.ExecContext(ctx, query, stationID, playedAt, client, title, artist, dur, cat, file, hash)
+	_, _ = db.ExecContext(ctx, query, stationID, playedAt, client, storedTitle, artist, dur, cat, file, hash)
 
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("OK"))
