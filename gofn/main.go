@@ -286,6 +286,16 @@ func (s *server) dispatch(w http.ResponseWriter, r *http.Request) {
 		s.handleGetTrafficAffidavit(w, r)
 	case "uploadTrafficLogFile":
 		s.handleUploadTrafficLogFile(w, r)
+	case "ingestVideoTrafficLogs":
+		s.handleIngestVideoTrafficLogs(w, r)
+	case "getVideoTrafficAdvertisers":
+		s.handleGetVideoTrafficAdvertisers(w, r)
+	case "getVideoTrafficAffidavit":
+		s.handleGetVideoTrafficAffidavit(w, r)
+	case "getVideoTrafficClients":
+		s.handleGetVideoTrafficClients(w, r)
+	case "uploadVideoTrafficLogFile":
+		s.handleUploadVideoTrafficLogFile(w, r)
 	case "getAdminAnalytics":
 		if !s.isServiceKey(r) {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"success": false, "error": "Unauthorized: Admin access required"})
@@ -462,6 +472,11 @@ func (s *server) publicFn(name string) bool {
 		"getTrafficAdvertisers",
 		"getTrafficAffidavit",
 		"uploadTrafficLogFile",
+		"ingestVideoTrafficLogs",
+		"getVideoTrafficAdvertisers",
+		"getVideoTrafficAffidavit",
+		"getVideoTrafficClients",
+		"uploadVideoTrafficLogFile",
 		"syncAzuraCastHistory",
 		"syncAzuraCastReports",
 		"snapshotAzuraCastListenersManual",
