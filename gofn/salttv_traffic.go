@@ -112,7 +112,7 @@ func (s *server) insertVideoTrafficRecords(ctx context.Context, channelID int, c
 		if hash == "" {
 			hash = computeVideoTrafficHash(chID, playedAt, rec.Filename, rec.Title)
 		}
-		client := s.resolveTrafficClient(ctx, rec.Title, rec.Filename, rec.Client)
+		client := s.resolveVideoClient(ctx, rec.Title, rec.Filename, rec.Client)
 		title := s.resolveTrafficTitle(ctx, rec.Title, rec.Filename)
 
 		rows = append(rows, map[string]any{

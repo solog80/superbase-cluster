@@ -87,7 +87,7 @@ You have two deployment options on the Windows machine. **Option A is recommende
 3. Open `config.json` in Notepad and verify the paths:
    ```json
    {
-     "log_dir": "C:\\StationPlaylist\\Logs",
+     "log_dir": "F:\\Air Data\\Playlist",
      "endpoint": "https://edge.solofx.net/api/v1/ingestTrafficLogs",
      "station_id": 307,
      "poll_interval_seconds": 15,
@@ -95,7 +95,7 @@ You have two deployment options on the Windows machine. **Option A is recommende
      "state_file": ".spl_agent_state.json"
    }
    ```
-   *(Note: If logs are stored on another drive or share, adjust `log_dir`, e.g. `"F:\\StationPlaylist\\Logs"` or `"\\\\AIR-PC\\Air Data\\Logs"`).*
+   *(Note: Auto-detects `F:\Air Data\Playlist` or network share `\\AIR-PC\Air Data\Playlist` automatically).*
 
 4. **Test the agent with Dry-Run Mode** (prints parsed adverts without sending):
    ```cmd

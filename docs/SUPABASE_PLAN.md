@@ -39,10 +39,10 @@ firewall holes, no public exposure of Postgres.
 | Envoy API gateway `:8555` (Studio + REST + Auth + Storage + Realtime) | ✅ verified (read via REST 200) |
 | Supavisor pooler `:55432` (DB access), tenant `supabase` | ✅ verified (CREATE/INSERT/COMMIT) |
 | WAL-G bundled in `supabase/postgres` image (`/home/wal-g`) | ✅ present |
-| Replication readiness | ✅ **`max_wal_senders=20`, `max_replication_slots=10` on us1 primary** + all 4 replicas (`wal-g.conf` on each) |
+| Replication readiness | ✅ **`max_wal_senders=20`, `max_replication_slots=10`, `max_slot_wal_keep_size=16GB`** on us1 primary + all 4 replicas (`wal-g.conf` on each). ⚠️ Slot retention was 512MB (too low — silent slot invalidation, forcing re-clones); raised to 16GB. |
 | Raw Postgres host-port exposure for `pg_basebackup` | ✅ `100.74.77.39:55433 → 55432` (tailnet only) |
 | **QNAP read replica** (`supabase-replica` on ug) | ✅ **re-cloned Aug 2026 after outage** — streaming, caught up (≤5s lag), `100.116.185.70:55432` |
-| **QNAP read API** (`varnish-ug` `:5558`) | ✅ rebuilt (VCL was wiped) — serves `/rest/v1/` → local PostgREST |
+| **QNAP read API** (`supabase-rest-proxy` `:5556`) | ✅ nginx `/rest/v1/` → local PostgREST `:5555`; `varnish-ug` `:5558` is the QuObjects/S3 cache, **not** REST |
 | WAL-G continuous archiving → QNAP MinIO | ⚠️ configured (backup-push **still deferred**) — **TODO: enable so replicas can recover without re-clone** |
 | Tailscale tailnet (all 5 nodes joined) | ✅ per BUILD_PLAN Phase A |
 | **Supabase Realtime** (postgres_changes) | ✅ **enabled** — `epg_programs/epg_stations/tv_shows/seasons/episodes/ads/events` published to `supabase_realtime`; websocket through Varnish fixed (`return pipe` + `vcl_pipe`) |
@@ -55,8 +55,8 @@ firewall holes, no public exposure of Postgres.
 ### Replication plumbing (us1 → ug)
 - Replicator role: `replicator` / password in `.env` (`REPLICATOR_PASSWORD`).
 - `pg_hba.conf` (mounted at `/etc/postgresql/pg_hba.conf`): replication allowed from tailnet `100.64.0.0/10` and docker bridge `172.16.0.0/12`.
-- Replication slot: `qnap_replica_slot` (physical).
-- QNAP replica: `supabase/postgres:17.6.1.136`, data at `/share/CACHEDEV1_DATA/supabase-replica/pgdata`, `hot_standby=on` via mounted `wal-g.conf` override, listens on tailnet `100.116.185.70:55432`.
+- Replication slot: `qnap_replica_slot2` (physical; `qnap_replica_slot` was invalidated and dropped).
+- QNAP replica: `supabase/postgres:17.6.1.136`, data on docker volume `supabase-replica-pgdata-v2` (`/var/lib/postgresql/data`; old `supabase-replica-pgdata` retained as fallback), `hot_standby=on` via mounted `wal-g.conf` override, listens on tailnet `100.116.185.70:55432`.
 
 ### eu1 read replica + read API (Europe) ✅
 - `supabase-replica` on eu1: streaming replica from us1 (slot `eu1_replica_slot`), hot_standby=on, `100.116.100.32:55432`.
@@ -101,17 +101,18 @@ Envoy geo clusters cascade to **any surviving region** via `priority` levels. En
 |---|---|---|---|
 | **US (`rest`)** | us1 (`rest:3000`) + us2 (`100.82.159.75:5557`) | eu1 + eu2 | ug |
 | **EU (`eu1_rest`)** | eu1 (`100.116.100.32:5557`) + eu2 (`100.99.30.100:5557`) | ug | us1 + us2 |
-| **UG (`ug_rest`)** | ug (`100.116.185.70:5558`) | eu1 + eu2 | us1 + us2 |
+| **UG (`ug_rest`)** | ug (`100.116.185.70:5556`) | eu1 + eu2 | us1 + us2 |
 
-- Live-verified: stopping QNAP's `varnish-ug` → UG traffic still 200 (failed over to EU); restart → served locally again.
+- Live-verified: stopping QNAP's REST API (`supabase-rest-proxy`, `:5556`) → UG traffic still 200 (failed over to EU); restart → served locally again.
 - Health checks: `http_health_check /` (US), `tcp_health_check` (EU/UG). Config in `volumes/api/envoy/cds.yaml`.
 
 ### QNAP read-only REST API (geo-routing) ✅
 - `supabase-rest-replica`: `postgrest/postgrest:v14.12` → local replica (`127.0.0.1:5555`), same JWT_SECRET + anon key as us1. Reads only (replica is read-only).
-- **Read API served by `varnish-ug`** (container, `-a 0.0.0.0:5558`, VCL at `/opt/varnish-ug/default.vcl`): strips `/rest/v1/` and proxies to PostgREST (`127.0.0.1:5555`), caches anon reads 60s. Envoy `ug_rest` targets `100.116.185.70:5558`.
-  - ⚠️ The VCL was **wiped during the Aug 2026 outage** (path became an empty dir). Restored; **keep a copy in the repo** (`replica-configs/ug/default.vcl`).
+- **Read API served by `supabase-rest-proxy`** (nginx, host network, listen `:5556`): `/rest/v1/` → PostgREST (`127.0.0.1:5555`), `/` → Studio (`127.0.0.1:5557`). Envoy `ug_rest` targets `100.116.185.70:5556`.
+  - `varnish-ug` (`:5558`) is a **separate QuObjects/S3 cache** (posters/sprites/HLS), **not** the REST API — never repoint REST at `:5558`.
+  - ⚠️ The S3-cache VCL was wiped during the Aug 2026 outage (bind-mount path emptied); restore from `replica-configs/ug/varnish-ug.default.vcl`.
 - **Studio on ug** ✅: `supabase-postgres-meta` (`supabase-meta-ug`) + `supabase/studio` (`supabase-studio-ug`, `127.0.0.1:5557`) pointed at the replica; nginx serves `/` → Studio with basic auth (admin/dashboard pw), `/rest/v1/` → read API.
-- **Geo-routing** (Tailscale-native, single CF origin at us1): Envoy on us1 routes `GET/HEAD /rest/v1/*` with `CF-IPCountry` ∈ EU/Africa → cluster `ug_rest` (`100.116.185.70:5558`, over the Tailscale mesh). All **writes/auth/storage/realtime → us1** (replica is read-only; storage files live on us1). `edge.solofx.net` → us1 only; no ug tunnel required for geo-routing.
+- **Geo-routing** (Tailscale-native, single CF origin at us1): Envoy on us1 routes `GET/HEAD /rest/v1/*` with `CF-IPCountry` ∈ EU/Africa → cluster `ug_rest` (`100.116.185.70:5556`, over the Tailscale mesh). All **writes/auth/storage/realtime → us1** (replica is read-only; storage files live on us1). `edge.solofx.net` → us1 only; no ug tunnel required for geo-routing.
   - Files: `volumes/api/envoy/cds.yaml` (cluster `ug_rest`) + `lds.template.yaml` (route `rest-v1-geo-ug`, added to Lua `PROTECTED_ROUTES`).
 
 ### Cloudflare entry + caching (free tier) ✅
@@ -277,12 +278,14 @@ Documented, tested procedure:
     re-add the upgrade headers in a `vcl_pipe` block. Applied to us1's `supabase-varnish`.
 13. **A replica that lags past WAL retention needs a full re-clone.** If the primary recycles
     the WAL the replica still needs (`requested WAL segment ... already removed`), streaming
-    can't resume — run `pg_basebackup` fresh (§ QNAP re-clone runbook). Enable WAL-G
-    archiving + `wal_keep_size` (TODO) so long outages recover without re-cloning.
+    can't resume — run `pg_basebackup` fresh (§ QNAP re-clone runbook). WAL-G archiving is
+    enabled and `max_slot_wal_keep_size` is now **16GB** (512MB silently invalidated slots
+    during outages); a replica offline beyond that still needs a re-clone.
 14. **Container config bind-mounts can be wiped by a power outage.** QNAP's `varnish-ug`
-    VCL path became an empty directory after the outage, taking the read API down. Keep
-    copies of every container config (VCL, nginx, postgres overrides) in the repo
-    (`replica-configs/`) so a wipe is a one-command restore.
+    S3-cache VCL path became an empty directory after the outage (the read API is nginx
+    `supabase-rest-proxy` on `:5556` and is unaffected by that VCL). Keep copies of every
+    container config (VCL, nginx, postgres overrides) in the repo (`replica-configs/`) so a
+    wipe is a one-command restore.
 15. **QuObjects/Swift is open (no auth on GET object reads).** Verified: segments return 200
     with or without tokens/headers. The **only gate is the HMAC token** the worker/Go mesh puts
     on the *playlist*. If you drop per-segment validation, segment paths are effectively public
@@ -502,8 +505,8 @@ PGPASSWORD=$(cat /tmp/tspw.txt) psql -h 100.116.185.70 -p 55439 -U postgres -d a
 
 ## 12. QNAP Outage Post-Mortem (Aug 2026)
 
-**Event:** Power outage at the QNAP (ug). On return, the ug replica crashed, the read API
-was down, and UG users saw 503s until failover was added.
+**Event:** Power outage at the QNAP (ug). On return, the ug replica crashed and UG reads
+failed (503) until cross-region failover was added.
 
 ### Timeline & root causes
 1. **Replica crash-loop on reboot** — primary had `max_wal_senders=20` but QNAP still had
@@ -512,28 +515,39 @@ was down, and UG users saw 503s until failover was added.
 2. **WAL purged during the outage** — QNAP was ~8h behind; the primary recycled the WAL
    segments it needed (`requested WAL segment ... already removed`). Streaming couldn't
    resume → required a **full `pg_basebackup` re-clone** (Gotcha #13).
-3. **`varnish-ug` VCL wiped** — the bind-mounted VCL path became an empty directory,
-   so the read API (`:5558`) was down (Gotcha #14).
+   - Root cause of the purge: **`max_slot_wal_keep_size=512MB`** (a standby offline longer
+     than that gets its slot invalidated — `wal_status=lost`). Raised to **16GB**.
+3. **QNAP read API down** — REST is nginx (`supabase-rest-proxy`, `:5556`), not
+   `varnish-ug`. The `varnish-ug` S3-cache VCL was also wiped (bind-mount emptied);
+   both were rebuilt (Gotcha #14).
 4. **No failover** — UG geo-routed to `ug_rest` (QNAP only); with QNAP down it 503'd.
    Fixed by adding cascading priorities (§2.6).
 
 ### Outcome / fixes applied
 - Re-cloned the QNAP Postgres replica (fresh `pg_basebackup` + `qnap_replica_slot`), caught up ≤5s.
-- Rebuilt `varnish-ug` VCL on `:5558` (video varnish `varnish-cache` untouched).
+- Rebuilt the QNAP `varnish-ug` **S3-cache** VCL on `:5558` (REST is nginx `supabase-rest-proxy` on `:5556`; video varnish `varnish-cache` untouched).
 - Bumped `max_wal_senders=20`/`max_replication_slots=10` on all 4 replicas.
 - Added cascading cross-region failover in envoy (§2.6); live-verified UG→EU→US.
 - App read path moved to `/rest/v1` RPCs (CDN + Varnish + geo) so a region being down
   no longer hammers us1 (§2.5).
+- Raised `max_slot_wal_keep_size` **512MB → 16GB** and added `replica-health.timer` on us1
+  (5-min checks for lost/inactive slots, lag, archiver failures, disk; see
+  `scripts/replica-health.sh`) with optional `ALERT_WEBHOOK_URL`.
 
 ### Open TODOs (prevention)
-- [ ] **WAL-G continuous archiving → MinIO** (currently deferred) so replicas recover from
-      long outages without a full re-clone.
-- [ ] Set `wal_keep_size` on the primary as cheap insurance.
-- [ ] Commit all container configs (VCL, nginx, postgres overrides) to the repo
-      (`replica-configs/`) — see §14.
+- [ ] **WAL-G backup-push (full base backups)** — continuous WAL archiving is active
+      (verified: 44k archived, 0 pending), but scheduled full backups are still deferred.
+- [x] `wal_keep_size=8GB` on the primary.
+- [x] `max_slot_wal_keep_size=16GB` (was 512MB) — slots no longer invalidate after short outages.
+- [x] `replica-health.timer` on us1 — 5-min slot/lag/archiver/disk checks + optional webhook.
+- [ ] Commit remaining container configs (QNAP `nginx-rest`, wal-g overrides) to
+      `replica-configs/` — see §14.
 - [ ] `scripts/replica-config.sh` to apply Postgres settings to all nodes in lockstep.
 - [ ] Enable QNAP snapshots on the replica data/config volume for instant rollback.
-- [ ] Prometheus alerts: replica down / replay lag > 5min / crash-loop.
+- [ ] Prometheus alerts (in addition to the systemd timer): replica down / replay lag
+      > 5 min / crash-loop.
+- [ ] Optional guarded auto-reclone (opt-in; only when slot=lost and replica down > 15 min;
+      dry-run mode first).
 
 ### QNAP replica re-clone runbook (when WAL is purged)
 ```sh
@@ -599,7 +613,8 @@ Track the per-node config files that were lost during the outage so recovery is 
 ```
 replica-configs/
   ug/
-    varnish-ug.default.vcl      # :5558 read API VCL
+    varnish-ug.default.vcl      # :5558 QuObjects/S3 cache VCL (NOT REST)
+    nginx-rest/nginx.conf       # :5556 read API (/rest/v1 -> PostgREST :5555)
     wal-g.conf                  # max_wal_senders=20 etc.
   eu1/ eu2/ us2/ us1/
     wal-g.conf
@@ -1028,7 +1043,7 @@ Full design, implementation, and deployment of the **Dart BFF Gateway** (`saltme
 |---|---|---|---|---|---|
 | **us1 (Primary)** | `Edge` (`100.74.77.39`) | `:8080` | `http://100.74.77.39:8090` | ✅ `200 OK` | **Prio 0** (Primary) |
 | **eu1 (Europe)** | `origin-contabo` (`100.116.100.32`) | `:8088` | `http://100.116.100.32:5557` | ✅ `200 OK` | **Prio 1** (EU Failover) |
-| **ug (Africa)** | `nas-ts` QNAP (`100.116.185.70`) | `:8088` | `http://100.116.185.70:5558` | ✅ `200 OK` | **Prio 2** (Africa Failover) |
+| **ug (Africa)** | `nas-ts` QNAP (`100.116.185.70`) | `:8088` | `http://100.116.185.70:5556` | ✅ `200 OK` | **Prio 2** (Africa Failover) |
 
 ### 21.2 Envoy Cascading Priority Configuration (`replica-configs/us1/envoy-cds.yaml`)
 Envoy's `dart_bff` cluster routes requests across the 3 BFF instances with priority tiers and automatic health checking:

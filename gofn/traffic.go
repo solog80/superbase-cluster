@@ -261,13 +261,50 @@ func isPlausibleClient(name string) bool {
 	return false
 }
 
+var adFilenameRe = regexp.MustCompile(`^(.+?\S)-(\S.*)$`)
+
+// clientFromAdFilename parses the "Client-AdName.ext" convention: the
+// advertiser is the text before the first hyphen that has no surrounding
+// spaces (so prose titles like "Show - Part 2" are ignored).
+func clientFromAdFilename(filename, title string) string {
+	name := strings.TrimSpace(filename)
+	if name == "" {
+		name = strings.TrimSpace(title)
+	}
+	if name == "" {
+		return ""
+	}
+	base := name
+	if i := strings.LastIndexAny(base, `\/`); i >= 0 {
+		base = base[i+1:]
+	}
+	base = strings.TrimSpace(base)
+	if i := strings.LastIndex(base, "."); i > 0 {
+		base = base[:i]
+	}
+	m := adFilenameRe.FindStringSubmatch(base)
+	if len(m) != 3 {
+		return ""
+	}
+	candidate := strings.ReplaceAll(strings.TrimSpace(m[1]), "_", " ")
+	candidate = strings.Join(strings.Fields(candidate), " ")
+	if !isPlausibleClient(candidate) {
+		return ""
+	}
+	return candidate
+}
+
 // resolveTrafficClient infers the advertiser when the Client column is empty in
 // manual logs. Precedence: explicit client → DB-driven rules →
 // filename "Client - Ad Name" prefix → "Other Advert" / "Unassigned".
 func (s *server) resolveTrafficClient(ctx context.Context, title, filename, explicit string) string {
-	if strings.TrimSpace(explicit) != "" {
-		return strings.TrimSpace(explicit)
+	explicit = strings.TrimSpace(explicit)
+	// A caller-side fallback marker is not a real client. Re-resolve it against
+	// the DB rules so rows logged before a rule existed can still be attributed.
+	if !isUnresolvedClient(explicit) {
+		return explicit
 	}
+
 	rules := s.loadClientRules(ctx)
 	target := title + " " + filename
 	for _, p := range rules {
@@ -277,6 +314,46 @@ func (s *server) resolveTrafficClient(ctx context.Context, title, filename, expl
 	}
 	if c := clientFromFilename(filename, rules); c != "" {
 		return c
+	}
+	if explicit != "" {
+		return explicit
+	}
+	if strings.Contains(strings.ToLower(filename), "advert") || strings.Contains(strings.ToLower(title), "advert") {
+		return "Other Advert"
+	}
+	return "Unassigned"
+}
+
+func isUnresolvedClient(name string) bool {
+	name = strings.TrimSpace(name)
+	return name == "" ||
+		strings.EqualFold(name, "Other Advert") ||
+		strings.EqualFold(name, "Unassigned") ||
+		strings.EqualFold(name, "Unknown")
+}
+
+// resolveVideoClient treats the DB rules and the Client-AdName filename
+// convention as authoritative for TV; the caller's value is a last resort.
+func (s *server) resolveVideoClient(ctx context.Context, title, filename, explicit string) string {
+	rules := s.loadClientRules(ctx)
+	target := title + " " + filename
+	for _, p := range rules {
+		if p.pattern.MatchString(target) {
+			return p.client
+		}
+	}
+	if c := clientFromFilename(filename, rules); c != "" {
+		return c
+	}
+	if c := clientFromAdFilename(filename, title); c != "" {
+		return c
+	}
+	explicit = strings.TrimSpace(explicit)
+	if !isUnresolvedClient(explicit) {
+		return explicit
+	}
+	if explicit != "" {
+		return explicit
 	}
 	if strings.Contains(strings.ToLower(filename), "advert") || strings.Contains(strings.ToLower(title), "advert") {
 		return "Other Advert"
