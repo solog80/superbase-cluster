@@ -46,8 +46,9 @@ scp /tmp/salt-gofn Edge:/opt/supabase-gofn/salt-gofn
 TV/radio traffic, the StationPlaylist webhook, content/ad analytics, and Varnish
 snapshots can write to a durable on-disk queue before acknowledging the client.
 When TimescaleDB (QNAP) is unreachable the queue keeps the batches; a background
-drainer replays them oldest first when the database returns. Clients are
-unchanged: the edge still returns HTTP 200 with the same response fields.
+drainer replays them when the database returns, draining TV/radio traffic ahead
+of analytics snapshots. Clients are unchanged: the edge still returns HTTP 200
+with the same response fields.
 TV/radio traffic replay is idempotent (`played_at, log_hash`). Analytics replay
 is at-least-once: a crash after the TSDB commit but before the outbox ack can
 duplicate that batch. EPG/bulk replace jobs are not queued; they rebuild from

@@ -303,8 +303,8 @@ func (o *outbox) DrainOnce(ctx context.Context, handle func(context.Context, out
 }
 
 func (o *outbox) firstDue(now time.Time) ([]byte, *outboxJob, error) {
-	var keyCopy []byte
-	var found *outboxJob
+	var priorityKey, fallbackKey []byte
+	var priorityJob, fallbackJob *outboxJob
 	err := o.db.View(func(tx *bolt.Tx) error {
 		pending := tx.Bucket(outboxPendingBucket)
 		if pending == nil {
@@ -319,13 +319,28 @@ func (o *outbox) firstDue(now time.Time) ([]byte, *outboxJob, error) {
 			if job.NextAttemptAt.After(now) {
 				continue
 			}
-			keyCopy = append([]byte(nil), k...)
-			found = &job
-			return nil
+			if fallbackJob == nil {
+				fallbackKey = append([]byte(nil), k...)
+				fallbackJob = &job
+			}
+			// Billing traffic jumps ahead of analytics snapshots, which can
+			// otherwise delay TV/radio logs for many minutes after an outage.
+			if isPriorityOutboxKind(job.Kind) {
+				priorityKey = append([]byte(nil), k...)
+				priorityJob = &job
+				break
+			}
 		}
 		return nil
 	})
-	return keyCopy, found, err
+	if priorityJob != nil {
+		return priorityKey, priorityJob, nil
+	}
+	return fallbackKey, fallbackJob, err
+}
+
+func isPriorityOutboxKind(kind string) bool {
+	return kind == outboxKindVideoIngest || kind == outboxKindRadioIngest
 }
 
 func (o *outbox) markDone(key []byte) error {

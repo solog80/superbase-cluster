@@ -70,6 +70,29 @@ func TestOutboxEnqueueDedupeAndDrain(t *testing.T) {
 	}
 }
 
+func TestOutboxPrioritizesTrafficKinds(t *testing.T) {
+	ob := testOutbox(t, outboxConfig{MaxAttempts: 0, DedupeTTL: time.Hour})
+	if _, err := ob.Enqueue(outboxKindAnalyticsRows, "analytics", map[string]string{"a": "b"}, time.Now()); err != nil {
+		t.Fatalf("enqueue analytics: %v", err)
+	}
+	if _, err := ob.Enqueue(outboxKindVideoIngest, "video", map[string]string{"a": "b"}, time.Now()); err != nil {
+		t.Fatalf("enqueue video: %v", err)
+	}
+
+	var order []string
+	for i := 0; i < 2; i++ {
+		if _, err := ob.DrainOnce(context.Background(), func(_ context.Context, job outboxJob) error {
+			order = append(order, job.Kind)
+			return nil
+		}); err != nil {
+			t.Fatalf("DrainOnce: %v", err)
+		}
+	}
+	if len(order) != 2 || order[0] != outboxKindVideoIngest || order[1] != outboxKindAnalyticsRows {
+		t.Fatalf("order = %v, want video first", order)
+	}
+}
+
 func TestOutboxRetriesThenDeadLetters(t *testing.T) {
 	ob := testOutbox(t, outboxConfig{MaxAttempts: 2, DedupeTTL: time.Hour})
 
