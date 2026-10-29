@@ -12,9 +12,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -31,7 +33,8 @@ type server struct {
 	osInsecure bool
 	osClient   *http.Client
 
-	tsdb *tsdbConn
+	tsdb   *tsdbConn
+	outbox *outbox
 
 	adsMu    sync.Mutex
 	adsCache map[string]adsCacheEntry
@@ -107,6 +110,24 @@ func main() {
 		log.Printf("opensearch search enabled: %s", s.osURL)
 	}
 
+	runCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if getenvBool("OUTBOX_ENABLED", false) {
+		ob, oerr := newOutbox(outboxConfigFromEnv())
+		if oerr != nil {
+			log.Fatalf("[Outbox] disabled: %v", oerr)
+		}
+		s.outbox = ob
+		log.Printf("[Outbox] enabled path=%s max_bytes=%d dedupe_ttl=%s", ob.cfg.Path, ob.cfg.MaxBytes, ob.cfg.DedupeTTL)
+		if getenvBool("OUTBOX_DRAIN", true) {
+			go s.outbox.Run(runCtx, s.handleOutboxJob)
+			log.Printf("[Outbox] drainer started")
+		} else {
+			log.Printf("[Outbox] drainer disabled (store-only)")
+		}
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.dispatch)
 
@@ -118,9 +139,20 @@ func main() {
 	go startVarnishUDPListener(getenv("VARNISH_LOG_PORT", "8092"))
 
 	port := getenv("PORT", "8080")
-	log.Printf("salt-gofn listening on :%s rest=%s tsdb=%v", port, s.restURL, tsdb != nil)
-	if err := http.ListenAndServe(":"+port, mux); err != nil {
+	log.Printf("salt-gofn listening on :%s rest=%s tsdb=%v outbox=%v", port, s.restURL, tsdb != nil, s.outbox != nil)
+
+	srv := &http.Server{Addr: ":" + port, Handler: mux}
+	go func() {
+		<-runCtx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+	}()
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
+	}
+	if s.outbox != nil {
+		_ = s.outbox.Close()
 	}
 }
 
@@ -144,6 +176,8 @@ func (s *server) dispatch(w http.ResponseWriter, r *http.Request) {
 	switch name {
 	case "health":
 		s.handleHealth(w, r)
+	case "replayOutboxDead":
+		s.handleReplayOutboxDead(w, r)
 	case "getApiConfig":
 		s.handleGetApiConfig(w, r)
 	case "catalog":
@@ -520,18 +554,19 @@ func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if s.tsdb != nil {
-		adDB, aerr := s.tsdbDB(ctx)
-		if aerr != nil {
-			out["tsdb_status"] = "unavailable"
-			out["tsdb_error"] = aerr.Error()
-		} else if err := adDB.PingContext(ctx); err != nil {
-			out["tsdb_status"] = "unavailable"
-			out["tsdb_error"] = err.Error()
-		} else {
+		if ok, terr := s.tsdb.status(ctx); ok {
 			out["tsdb_status"] = "ok"
+		} else {
+			out["tsdb_status"] = "unavailable"
+			out["tsdb_error"] = terr.Error()
 		}
 	} else {
 		out["tsdb_status"] = "disabled"
+	}
+	if s.outbox != nil {
+		out["outbox"] = s.outbox.Stats()
+	} else {
+		out["outbox"] = map[string]any{"enabled": false}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": out})
 }

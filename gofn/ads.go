@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -169,11 +170,6 @@ func (s *server) handleRefreshAdCache(w http.ResponseWriter, r *http.Request) {
 // events into the TimescaleDB ad_events hypertable (replaces BigQuery +
 // Firestore fallback).
 func (s *server) handleBatchTrackAdEvents(w http.ResponseWriter, r *http.Request) {
-	db, err := s.tsdbDB(r.Context())
-	if err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"success": false, "error": err.Error()})
-		return
-	}
 	var body struct {
 		Events []map[string]any `json:"events"`
 	}
@@ -187,11 +183,7 @@ func (s *server) handleBatchTrackAdEvents(w http.ResponseWriter, r *http.Request
 	}
 
 	now := time.Now().UTC()
-	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
-	defer cancel()
-
-	stmt := `INSERT INTO public.ad_events (ad_id, event_type, timestamp, user_id, watch_time, metadata)
-	         VALUES ($1, $2, $3, $4, $5, $6)`
+	rows := make([]map[string]any, 0, len(body.Events))
 	for _, ev := range body.Events {
 		ts, ok := parseEventTime(ev["timestamp"])
 		if !ok {
@@ -205,13 +197,42 @@ func (s *server) handleBatchTrackAdEvents(w http.ResponseWriter, r *http.Request
 		if m, ok := ev["metadata"]; ok && m != nil {
 			metadata = m
 		}
-		userID := firstNonEmpty(ev["user_id"], "anonymous")
-		if _, err := db.ExecContext(ctx, stmt,
-			ev["ad_id"], ev["event_type"], ts, userID, watchTime, metadata); err != nil {
-			log.Printf("ad_events insert error: %v", err)
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "error": err.Error()})
+		rows = append(rows, map[string]any{
+			"ad_id":      ev["ad_id"],
+			"event_type": ev["event_type"],
+			"timestamp":  ts,
+			"user_id":    firstNonEmpty(ev["user_id"], "anonymous"),
+			"watch_time": watchTime,
+			"metadata":   metadata,
+		})
+	}
+
+	if s.outbox != nil {
+		payload := analyticsRowsJob{Table: "ad_events", Rows: rows, ReceivedAt: now}
+		duplicate, err := s.outbox.Enqueue(outboxKindAnalyticsRows, analyticsDedupeKey("ad_events", body.Events), payload, now)
+		if err != nil {
+			w.Header().Set("Retry-After", "60")
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+				"success": false, "error": "log buffer unavailable: " + err.Error(), "buffered": false,
+			})
 			return
 		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"success": true, "eventsProcessed": len(body.Events), "queued": len(body.Events),
+			"buffered": true, "duplicate": duplicate,
+		})
+		return
+	}
+
+	if err := s.insertRowsJSON(r.Context(), "ad_events", rows); err != nil {
+		log.Printf("ad_events insert error: %v", err)
+		if errors.Is(err, errTsdbUnavailable) {
+			w.Header().Set("Retry-After", "60")
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"success": false, "error": err.Error()})
+		} else {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "error": err.Error()})
+		}
+		return
 	}
 
 	log.Printf("ad_events: inserted %d rows into timescale", len(body.Events))

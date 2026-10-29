@@ -59,6 +59,7 @@ func (s *server) callRadioRPCRaw(w http.ResponseWriter, r *http.Request, rpc str
 	payload, err := s.radioRPCPayload(ctx, rpc, order, args, rpcCacheTTL)
 	if err != nil {
 		if errors.Is(err, errTsdbUnavailable) {
+			w.Header().Set("Retry-After", "60")
 			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": err.Error()})
 		} else {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})

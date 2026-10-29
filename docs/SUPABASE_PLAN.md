@@ -371,6 +371,13 @@ client → edge.solofx.net/api/v1/<name>   (public, via CF + worker)
 3. `scp salt-gofn-linux Edge:/opt/supabase-gofn/` → `docker build` → `docker rm -f supabase-api && docker run -d --name supabase-api --network supabase_default -e PG_REST_URL=http://api-gw:8000/rest/v1 -e SERVICE_ROLE_KEY=... -e ANON_KEY=... salt-gofn`
 4. Test via `curl http://127.0.0.1:8555/api/v1/<name>`.
 
+> **TV traffic outbox:** when recreating `supabase-api`, add
+> `-v /opt/supabase-gofn/spool:/var/lib/salt-gofn -e OUTBOX_ENABLED=1 -e OUTBOX_PATH=/var/lib/salt-gofn/outbox.db -e OUTBOX_DRAIN=1`
+> so TV/radio traffic, content/ad analytics, and Varnish snapshots are buffered
+> durably while TimescaleDB is unreachable. Use `OUTBOX_DRAIN=0` for store-only
+> during an outage. Recover dead jobs with the service-role endpoint
+> `POST /api/v1/replayOutboxDead`. See the repo README.
+
 ### Verification (Aug 2026)
 - `health` → 200 `db_status:ok`; `catalog?q=Con` → `Connected` (live data).
 - No/invalid key → **401**. Public path `edge.solofx.net/api/v1/health` → **200** (CORS OK).

@@ -13,14 +13,14 @@ import (
 )
 
 type VarnishViewerSession struct {
-	Stream    string    // "stream" or "stream2"
-	ClientIP  string    // e.g. "154.72.217.98"
-	SessionID string    // e.g. "75_" or "105_oIXQSGmJ"
+	Stream    string // "stream" or "stream2"
+	ClientIP  string // e.g. "154.72.217.98"
+	SessionID string // e.g. "75_" or "105_oIXQSGmJ"
 	LastSeen  time.Time
 }
 
 type MinuteSnapshot struct {
-	Minute        time.Time
+	Minute         time.Time
 	Stream1Viewers int
 	Stream2Viewers int
 }
@@ -91,17 +91,33 @@ func (vt *VarnishWindowTracker) CurrentCounts() (int, int) {
 }
 
 func (s *server) persistVarnishSnapshot(ctx context.Context) error {
+	s1, s2 := globalVarnishTracker.CurrentCounts()
+	now := time.Now().UTC().Truncate(time.Minute)
+
+	if s.outbox != nil {
+		payload := varnishSnapshotJob{
+			Timestamp: now, Stream1: s1, Stream2: s2, ReceivedAt: time.Now().UTC(),
+		}
+		_, err := s.outbox.Enqueue(
+			outboxKindVarnishSnapshot,
+			fmt.Sprintf("varnish|%d|%d|%d", now.Unix(), s1, s2),
+			payload,
+			payload.ReceivedAt,
+		)
+		return err
+	}
+	return s.insertVarnishSnapshot(ctx, now, s1, s2)
+}
+
+func (s *server) insertVarnishSnapshot(ctx context.Context, ts time.Time, stream1, stream2 int) error {
 	db, err := s.tsdbDB(ctx)
 	if err != nil {
 		return err
 	}
-	s1, s2 := globalVarnishTracker.CurrentCounts()
-	now := time.Now().UTC().Truncate(time.Minute)
-
 	_, err = db.ExecContext(ctx,
 		`INSERT INTO public.varnish_stream_snapshots (timestamp, stream, viewers)
          VALUES ($1, 'stream', $2), ($1, 'stream2', $3)`,
-		now, s1, s2,
+		ts.UTC(), stream1, stream2,
 	)
 	return err
 }

@@ -1,8 +1,8 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -90,9 +90,9 @@ func (s *server) trackView(w http.ResponseWriter, r *http.Request) {
 func (s *server) trackImpression(w http.ResponseWriter, r *http.Request) {
 	s.ingestBatch(w, r, "content_impressions", func(ev map[string]any, common map[string]any) map[string]any {
 		out := map[string]any{
-			"content_id":     ev["content_id"],
-			"content_type":   ev["content_type"],
-			"content_name":   ev["content_name"],
+			"content_id":      ev["content_id"],
+			"content_type":    ev["content_type"],
+			"content_name":    ev["content_name"],
 			"impression_type": ev["impression_type"],
 		}
 		for k, v := range common {
@@ -137,14 +137,14 @@ func (s *server) trackContentSession(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ingestBatch decodes { events: [...] }, normalizes each via build, and inserts
-// into the given TSDB hypertable. Column map keys are the snake_case columns.
+// ingestBatch decodes { events: [...] }, normalizes each via build, and either
+// queues the rows durably (outbox enabled) or inserts them into the TSDB table.
 func (s *server) ingestBatch(w http.ResponseWriter, r *http.Request, table string, build func(map[string]any, map[string]any) map[string]any) {
-	db, err := s.tsdbDB(r.Context())
-	if err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": err.Error()})
+	if !allowedAnalyticsTable(table) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "unsupported analytics table"})
 		return
 	}
+
 	var body trackReq
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid body: " + err.Error()})
@@ -156,26 +156,36 @@ func (s *server) ingestBatch(w http.ResponseWriter, r *http.Request, table strin
 	}
 
 	now := time.Now().UTC()
-	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
-	defer cancel()
-
-	// Build the INSERT from the first row's keys (all rows share a shape).
 	rows := make([]map[string]any, 0, len(body.Events))
 	for _, ev := range body.Events {
 		rows = append(rows, build(ev, collectCommon(r, ev, now)))
 	}
 
-	cols := make([]string, 0, len(rows[0]))
-	for k := range rows[0] {
-		cols = append(cols, k)
+	if s.outbox != nil {
+		payload := analyticsRowsJob{Table: table, Rows: rows, ReceivedAt: now}
+		duplicate, err := s.outbox.Enqueue(outboxKindAnalyticsRows, analyticsDedupeKey(table, body.Events), payload, now)
+		if err != nil {
+			w.Header().Set("Retry-After", "60")
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+				"success": false, "error": "log buffer unavailable: " + err.Error(), "buffered": false,
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"success": true, "count": len(body.Events), "queued": len(body.Events),
+			"buffered": true, "duplicate": duplicate,
+		})
+		return
 	}
 
-	// INSERT ... (cols) VALUES (...), (...) — single statement, batched.
-	placeholders, args := insertPlaceholders(rows, cols)
-	stmt := "INSERT INTO public." + table + " (" + joinCols(cols) + ") VALUES " + placeholders
-	if _, err := db.ExecContext(ctx, stmt, args...); err != nil {
+	if err := s.insertRowsJSON(r.Context(), table, rows); err != nil {
 		log.Printf("%s insert error: %v", table, err)
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		if errors.Is(err, errTsdbUnavailable) {
+			w.Header().Set("Retry-After", "60")
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": err.Error()})
+		} else {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		}
 		return
 	}
 

@@ -41,6 +41,50 @@ scp /tmp/salt-gofn Edge:/opt/supabase-gofn/salt-gofn
 # then on Edge: docker build -t salt-gofn:new /opt/supabase-gofn && recreate supabase-api
 ```
 
+## Edge outbox (TV ad logs)
+
+TV/radio traffic, the StationPlaylist webhook, content/ad analytics, and Varnish
+snapshots can write to a durable on-disk queue before acknowledging the client.
+When TimescaleDB (QNAP) is unreachable the queue keeps the batches; a background
+drainer replays them oldest first when the database returns. Clients are
+unchanged: the edge still returns HTTP 200 with the same response fields.
+TV/radio traffic replay is idempotent (`played_at, log_hash`). Analytics replay
+is at-least-once: a crash after the TSDB commit but before the outbox ack can
+duplicate that batch. EPG/bulk replace jobs are not queued; they rebuild from
+source on their normal schedule.
+
+Enable it on `supabase-api` by adding these to the existing `docker run`:
+
+```sh
+-v /opt/supabase-gofn/spool:/var/lib/salt-gofn \
+-e OUTBOX_ENABLED=1 \
+-e OUTBOX_PATH=/var/lib/salt-gofn/outbox.db \
+-e OUTBOX_DRAIN=1
+```
+
+Use `OUTBOX_DRAIN=0` for store-only mode during a QNAP outage, then restart with
+`OUTBOX_DRAIN=1` after the database returns. Optional tuning:
+`OUTBOX_MAX_BYTES` (default 5 GiB, logical queued bytes),
+`OUTBOX_MAX_ATTEMPTS` (0 = retry until success; default 0), `OUTBOX_DEDUPE_TTL_HOURS` (168),
+`OUTBOX_DRAIN_INTERVAL` (5s), `OUTBOX_RETRY_BASE` (5s), `OUTBOX_RETRY_MAX` (15m).
+
+Check queue depth and the last drain error at
+`https://edge.solofx.net/api/v1/health` under `data.outbox`. A full queue returns
+HTTP 503 with `Retry-After`, so the vMix agent keeps its watermark and retries.
+A non-zero `dead` count means a batch hit a permanent error (or you configured a
+retry limit). After fixing the cause, move dead jobs back to the queue:
+
+```sh
+curl -X POST -H "apikey: $SERVICE_ROLE_KEY" \
+  "https://edge.solofx.net/api/v1/replayOutboxDead?limit=1000"
+```
+
+This endpoint is service-role only. `OUTBOX_MAX_ATTEMPTS=0` (the default) retries
+transient failures forever, so a long QNAP outage does not dead-letter traffic.
+The bbolt file is single-writer: keep `supabase-api` at one container instance
+while this outbox is enabled. Make sure the container user can write
+`/opt/supabase-gofn/spool` on the host.
+
 ## Secrets
 
 Secrets are NOT in this repo. They live as env vars / container env / Cloudflare

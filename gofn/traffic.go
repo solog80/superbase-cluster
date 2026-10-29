@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/md5"
+	"crypto/sha256"
 	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
@@ -442,6 +443,11 @@ func (s *server) handleIngestTrafficLogs(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	if s.outbox != nil {
+		s.enqueueRadioIngest(w, req.StationID, req.Records, 0)
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -457,6 +463,45 @@ func (s *server) handleIngestTrafficLogs(w http.ResponseWriter, r *http.Request)
 		"received": len(req.Records),
 		"inserted": inserted,
 	})
+}
+
+// enqueueRadioJob durably buffers a radio traffic batch.
+func (s *server) enqueueRadioJob(stationID int, records []TrafficRecord) (bool, error) {
+	receivedAt := time.Now().UTC()
+	payload := radioIngestJob{StationID: stationID, Records: records, ReceivedAt: receivedAt}
+	return s.outbox.Enqueue(outboxKindRadioIngest, radioTrafficDedupeKey(payload), payload, receivedAt)
+}
+
+// enqueueRadioIngest writes the HTTP response used by the radio agent and CSV
+// upload. HTTP 200 keeps the existing agents' success checks unchanged.
+func (s *server) enqueueRadioIngest(w http.ResponseWriter, stationID int, records []TrafficRecord, parsed int) {
+	duplicate, err := s.enqueueRadioJob(stationID, records)
+	if err != nil {
+		w.Header().Set("Retry-After", "60")
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"success": false, "error": "log buffer unavailable: " + err.Error(),
+			"buffered": false, "received": len(records),
+		})
+		return
+	}
+	response := map[string]any{
+		"success": true, "station": stationID, "received": len(records),
+		"inserted": 0, "queued": len(records), "buffered": true, "duplicate": duplicate,
+	}
+	if parsed > 0 {
+		response["parsed"] = parsed
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func radioTrafficDedupeKey(payload radioIngestJob) string {
+	canonical := struct {
+		StationID int             `json:"station_id"`
+		Records   []TrafficRecord `json:"records"`
+	}{StationID: payload.StationID, Records: payload.Records}
+	encoded, _ := json.Marshal(canonical)
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:])
 }
 
 // insertTrafficRecords performs fast bulk-inserts using multi-row batching
@@ -588,6 +633,27 @@ func (s *server) handleStationPlaylistWebhook(w http.ResponseWriter, r *http.Req
 	}
 
 	dur := parseDurationMMSS(durStr)
+
+	if s.outbox != nil {
+		rec := TrafficRecord{
+			PlayedAt:        playedAt.Format(time.RFC3339),
+			TrackType:       "Spot",
+			Client:          clientParam,
+			Title:           title,
+			Artist:          artist,
+			DurationSeconds: dur,
+			Category:        cat,
+			Filename:        file,
+		}
+		if _, err := s.enqueueRadioJob(stationID, []TrafficRecord{rec}); err != nil {
+			http.Error(w, "queue unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+		return
+	}
+
 	hash := computeTrafficHash(stationID, playedAt, file, title)
 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
@@ -788,6 +854,11 @@ func (s *server) handleUploadTrafficLogFile(w http.ResponseWriter, r *http.Reque
 			Filename:        filename,
 			UserDJ:          userDJ,
 		})
+	}
+
+	if s.outbox != nil {
+		s.enqueueRadioIngest(w, 307, records, len(records))
+		return
 	}
 
 	// Reuse ingestion logic

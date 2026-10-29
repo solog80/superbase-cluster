@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -94,6 +95,28 @@ func (t *tsdbConn) conn(ctx context.Context) (*sql.DB, error) {
 	}
 	t.db = db
 	return db, nil
+}
+
+// status reports availability without blocking behind a slow dial. It is used
+// by /health so a downed QNAP does not make the health probe wait behind the
+// scheduler's connection attempts.
+func (t *tsdbConn) status(ctx context.Context) (bool, error) {
+	if t == nil {
+		return false, errors.New("analytics store not configured")
+	}
+	if !t.mu.TryLock() {
+		return false, errors.New("connection attempt in progress")
+	}
+	defer t.mu.Unlock()
+	if t.db == nil {
+		return false, errors.New("not connected")
+	}
+	pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if err := t.db.PingContext(pingCtx); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // isUp reports whether a live connection exists (does not dial).

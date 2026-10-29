@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/md5"
+	"crypto/sha256"
 	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
@@ -69,6 +70,11 @@ func (s *server) handleIngestVideoTrafficLogs(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	if s.outbox != nil {
+		s.enqueueVideoTraffic(w, req.ChannelID, req.ChannelName, req.Records, 0)
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -83,6 +89,58 @@ func (s *server) handleIngestVideoTrafficLogs(w http.ResponseWriter, r *http.Req
 		"received": len(req.Records),
 		"inserted": inserted,
 	})
+}
+
+// enqueueVideoTraffic durably buffers a video batch and acknowledges it with
+// the same HTTP 200 shape the existing vMix/radio clients already accept.
+func (s *server) enqueueVideoTraffic(w http.ResponseWriter, channelID int, channelName string, records []VideoTrafficRecord, parsed int) {
+	receivedAt := time.Now().UTC()
+	payload := videoIngestJob{
+		ChannelID:   channelID,
+		ChannelName: channelName,
+		Records:     records,
+		ReceivedAt:  receivedAt,
+	}
+	duplicate, err := s.outbox.Enqueue(outboxKindVideoIngest, videoTrafficDedupeKey(payload), payload, receivedAt)
+	if err != nil {
+		w.Header().Set("Retry-After", "60")
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"success":  false,
+			"error":    "log buffer unavailable: " + err.Error(),
+			"buffered": false,
+			"received": len(records),
+		})
+		return
+	}
+
+	response := map[string]any{
+		"success":   true,
+		"channel":   channelID,
+		"received":  len(records),
+		"inserted":  0,
+		"queued":    len(records),
+		"buffered":  true,
+		"duplicate": duplicate,
+	}
+	if parsed > 0 {
+		response["parsed"] = parsed
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func videoTrafficDedupeKey(payload videoIngestJob) string {
+	canonical := struct {
+		ChannelID   int                  `json:"channel_id"`
+		ChannelName string               `json:"channel_name"`
+		Records     []VideoTrafficRecord `json:"records"`
+	}{
+		ChannelID:   payload.ChannelID,
+		ChannelName: payload.ChannelName,
+		Records:     payload.Records,
+	}
+	encoded, _ := json.Marshal(canonical)
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:])
 }
 
 func (s *server) insertVideoTrafficRecords(ctx context.Context, channelID int, channelName string, records []VideoTrafficRecord) (int, error) {
@@ -283,6 +341,11 @@ func (s *server) handleUploadVideoTrafficLogFile(w http.ResponseWriter, r *http.
 	records, perr := parseVideoLogCSV(file, channel)
 	if perr != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "parse failed: " + perr.Error()})
+		return
+	}
+
+	if s.outbox != nil {
+		s.enqueueVideoTraffic(w, channel, channelName, records, len(records))
 		return
 	}
 
