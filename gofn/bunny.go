@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -12,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -28,6 +30,111 @@ func bunnyCDNHostname() string {
 		return h
 	}
 	return "vz-13b87e04-41b.b-cdn.net"
+}
+
+// bunnyCollectionRef is the subset of a Bunny Stream collection we need.
+type bunnyCollectionRef struct {
+	GUID string `json:"guid"`
+	Name string `json:"name"`
+}
+
+// bunnyCreateCollection creates a Bunny Stream collection named after the show
+// title (e.g. "UG Parliament") and returns its guid. It reuses an existing
+// collection with the same name (case-insensitive) to avoid duplicates.
+// Best-effort: callers treat a failure as non-fatal.
+func bunnyCreateCollection(ctx context.Context, client *http.Client, name string) (string, error) {
+	apiKey := bunnyAPIKey()
+	libID := bunnyLibraryID()
+	if apiKey == "" || libID == "" {
+		return "", fmt.Errorf("BUNNY_API_KEY/BUNNY_LIBRARY_ID not set")
+	}
+	base := fmt.Sprintf("https://video.bunnycdn.com/library/%s", libID)
+	trimmedName := strings.TrimSpace(name)
+
+	// Reuse an existing collection with the same name.
+	listCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	listReq, err := http.NewRequestWithContext(listCtx, http.MethodGet,
+		base+"/collections?page=1&itemsPerPage=1000", nil)
+	if err != nil {
+		return "", err
+	}
+	listReq.Header.Set("AccessKey", apiKey)
+	listReq.Header.Set("Accept", "application/json")
+	if resp, err := client.Do(listReq); err == nil {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		var list struct {
+			Items []bunnyCollectionRef `json:"items"`
+		}
+		if json.Unmarshal(body, &list) == nil {
+			for _, c := range list.Items {
+				if strings.EqualFold(strings.TrimSpace(c.Name), trimmedName) && c.GUID != "" {
+					return c.GUID, nil
+				}
+			}
+		}
+	}
+
+	// Create it.
+	payload, _ := json.Marshal(map[string]string{"name": trimmedName})
+	createCtx, cancel2 := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel2()
+	createReq, err := http.NewRequestWithContext(createCtx, http.MethodPost,
+		base+"/collections", bytes.NewReader(payload))
+	if err != nil {
+		return "", err
+	}
+	createReq.Header.Set("AccessKey", apiKey)
+	createReq.Header.Set("Content-Type", "application/json")
+	createReq.Header.Set("Accept", "application/json")
+	resp, err := client.Do(createReq)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 300 {
+		return "", fmt.Errorf("bunny create collection %d: %s", resp.StatusCode, string(body))
+	}
+	var created bunnyCollectionRef
+	if err := json.Unmarshal(body, &created); err != nil {
+		return "", err
+	}
+	if created.GUID == "" {
+		return "", fmt.Errorf("bunny create collection: empty guid in response")
+	}
+	return created.GUID, nil
+}
+
+// bunnyAssignVideoCollection sets collectionId on a Bunny video (best-effort).
+func bunnyAssignVideoCollection(ctx context.Context, client *http.Client, videoID, collectionID string) error {
+	apiKey := bunnyAPIKey()
+	libID := bunnyLibraryID()
+	if apiKey == "" || libID == "" || videoID == "" || collectionID == "" {
+		return nil
+	}
+	u := fmt.Sprintf("https://video.bunnycdn.com/library/%s/videos/%s", libID, videoID)
+	payload, _ := json.Marshal(map[string]string{"collectionId": collectionID})
+	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, u, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("AccessKey", apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("bunny assign video collection %d", resp.StatusCode)
+	}
+	return nil
 }
 
 // bunnyVideo mirrors the subset of the Bunny video object we need.

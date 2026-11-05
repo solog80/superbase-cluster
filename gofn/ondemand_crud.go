@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -101,10 +102,22 @@ func (s *server) handleCreateOnDemandShow(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
+
+	// Best-effort: create a Bunny Stream collection named after the show
+	// and store its guid. A failure is logged but never fails show creation.
+	var bunnyGUID string
+	if guid, cerr := bunnyCreateCollection(ctx, s.client, strings.TrimSpace(body.Title)); cerr != nil {
+		log.Printf("[createShow] bunny collection skipped: %v", cerr)
+	} else {
+		bunnyGUID = guid
+		_ = s.restPatch(ctx, "tv_shows", "id=eq."+url.QueryEscape(showID),
+			map[string]any{"bunny_guid": guid, "updated_at": now})
+	}
+
 	s.clearOndemandCache()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"success": true,
-		"show":    map[string]any{"id": showID, "title": strings.TrimSpace(body.Title)},
+		"show":    map[string]any{"id": showID, "title": strings.TrimSpace(body.Title), "bunnyGuid": bunnyGUID},
 		"message": "Show created successfully",
 	})
 }
@@ -475,16 +488,41 @@ func (s *server) handleCreateSfxEpisode(w http.ResponseWriter, r *http.Request) 
 		body.VideoID = ""
 	}
 
-	// Resolve show slug for ID generation.
+	// Resolve show slug for ID generation (and bunny_guid for Bunny uploads).
 	showSlug := generateSlug(body.ShowID)
-	if raw, _, err := s.doRest(ctx, "tv_shows", url.Values{"select": {"title"}, "id": {"eq." + body.ShowID}}); err == nil {
-		var rows []struct{ Title string `json:"title"` }
+	var showTitle, showBunnyGUID string
+	if raw, _, err := s.doRest(ctx, "tv_shows", url.Values{"select": {"title,bunny_guid"}, "id": {"eq." + body.ShowID}}); err == nil {
+		var rows []struct {
+			Title     string  `json:"title"`
+			BunnyGUID *string `json:"bunny_guid"`
+		}
 		if json.Unmarshal(raw, &rows) == nil && len(rows) == 1 {
+			showTitle = rows[0].Title
 			showSlug = generateSlug(rows[0].Title)
+			if rows[0].BunnyGUID != nil {
+				showBunnyGUID = *rows[0].BunnyGUID
+			}
 		}
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
+
+	// If uploading a Bunny episode to a show without a bunny_guid, create/link
+	// the Bunny collection now and assign the video to it.
+	if server == "bunny" {
+		if showBunnyGUID == "" && strings.TrimSpace(showTitle) != "" {
+			if guid, cerr := bunnyCreateCollection(ctx, s.client, strings.TrimSpace(showTitle)); cerr != nil {
+				log.Printf("[createEpisode] bunny collection skipped for %s: %v", body.ShowID, cerr)
+			} else {
+				showBunnyGUID = guid
+				_ = s.restPatch(ctx, "tv_shows", "id=eq."+url.QueryEscape(body.ShowID),
+					map[string]any{"bunny_guid": guid, "updated_at": now})
+			}
+		}
+		if showBunnyGUID != "" && body.BunnyGUID != "" {
+			_ = bunnyAssignVideoCollection(ctx, s.client, body.BunnyGUID, showBunnyGUID)
+		}
+	}
 
 	// Resolve or create the season.
 	var seasonID string
@@ -619,6 +657,14 @@ func (s *server) handleCreateSfxEpisode(w http.ResponseWriter, r *http.Request) 
 		var rows []struct{ ID string `json:"id"` }
 		if json.Unmarshal(raw, &rows) == nil {
 			_ = s.restPatch(ctx, "seasons", "id=eq."+url.QueryEscape(seasonID), map[string]any{"episode_count": len(rows), "updated_at": now})
+		}
+	}
+
+	// Update show seasonCount.
+	if raw, _, err := s.doRest(ctx, "seasons", url.Values{"select": {"id"}, "show_id": {"eq." + body.ShowID}}); err == nil {
+		var rows []struct{ ID string `json:"id"` }
+		if json.Unmarshal(raw, &rows) == nil {
+			_ = s.restPatch(ctx, "tv_shows", "id=eq."+url.QueryEscape(body.ShowID), map[string]any{"season_count": len(rows), "updated_at": now})
 		}
 	}
 
