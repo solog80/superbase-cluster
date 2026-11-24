@@ -13,6 +13,7 @@ const (
 	outboxKindRadioIngest     = "radio.ingest"
 	outboxKindAnalyticsRows   = "analytics.rows"
 	outboxKindVarnishSnapshot = "varnish.snapshot"
+	outboxKindPayment         = "payment.upsert"
 )
 
 type videoIngestJob struct {
@@ -39,6 +40,11 @@ type varnishSnapshotJob struct {
 	Stream1    int       `json:"stream1"`
 	Stream2    int       `json:"stream2"`
 	ReceivedAt time.Time `json:"received_at"`
+}
+
+type paymentJob struct {
+	Payment    paymentRecord `json:"payment"`
+	ReceivedAt time.Time     `json:"received_at"`
 }
 
 // handleOutboxJob dispatches one durable buffered write. Jobs are retried by
@@ -101,6 +107,18 @@ func (s *server) handleOutboxJob(ctx context.Context, job outboxJob) error {
 		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
 		return s.insertVarnishSnapshot(ctx, payload.Timestamp, payload.Stream1, payload.Stream2)
+
+	case outboxKindPayment:
+		var payload paymentJob
+		if err := json.Unmarshal(job.Payload, &payload); err != nil {
+			return permanentJob(fmt.Errorf("decode %s payload: %w", job.Kind, err))
+		}
+		if payload.Payment.PaymentUID == "" || payload.Payment.ExternalID == "" {
+			return permanentJob(fmt.Errorf("%s payload is missing payment identity", job.Kind))
+		}
+		ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
+		defer cancel()
+		return s.upsertPaymentTSDB(ctx, payload.Payment)
 
 	default:
 		return permanentJob(fmt.Errorf("unknown outbox job kind %q", job.Kind))

@@ -1,5 +1,32 @@
 # Implementation Plan: Server-Side Contribution Push Notifications & Email Receipts (Zero-Client Changes)
 
+> **Status: shipped (email portion).** The implementation lives in
+> `gofn/mailer.go` and `gofn/system_emails.go`; the migration is
+> `migrations/015_system_emails.sql`. Current design:
+>
+> - Contributions are read from the **Timescale `analytics.payments`** ledger
+>   (`status = 'COMPLETED'`). **No Directus dependency.**
+> - Idempotency/delivery state uses Supabase **`system_emails`** (key
+>   `contribution:<payment_uid>`), not `contribution_receipts`.
+> - Recipient resolution uses the **registered app email**: payment
+>   `transaction_id` → Firestore subscription, then payment phone →
+>   subscription/user → Supabase `users.email`. Anonymous users, blocked users
+>   and unmatched payments are logged as `skipped` with no email; set
+>   `CONTRIBUTION_FALLBACK_EMAIL` to alert an internal inbox instead.
+> - This ships **email only**; FCM push remains in the notifications subsystem.
+>
+> **Nov 2026 payments update:** Yo! payments now flow through the Dart BFF → Go
+> mesh and are written to the Timescale `analytics.payments` ledger. Legacy
+> app builds keep the Firebase IPNs, which bridge into the same ledger via
+> `POST /api/v1/recordYoPayment`; the mesh `/yoIpn` + `/yoFailure` handlers are
+> ready for the future cutover. The admin monetization dashboard reads the
+> ledger via `GET /api/v1/getPaymentMetrics`; see `SUPABASE_PLAN.md` §24.
+> Old-app MoMo remains Directus-only and is intentionally **not** in this
+> Timescale receipt poller (see §25).
+>
+> See the README section **System email (welcome + contribution receipts)** for
+> SMTP env vars and deployment.
+
 ## Goal Description
 Build a 100% server-side contribution notification and email receipt engine inside the **Go Mesh Service** (`superbase-cluster/gofn`), requiring **ZERO changes to `ConditionalPaymentForm.dart` or client app code**. 
 

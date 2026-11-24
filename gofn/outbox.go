@@ -340,7 +340,7 @@ func (o *outbox) firstDue(now time.Time) ([]byte, *outboxJob, error) {
 }
 
 func isPriorityOutboxKind(kind string) bool {
-	return kind == outboxKindVideoIngest || kind == outboxKindRadioIngest
+	return kind == outboxKindVideoIngest || kind == outboxKindRadioIngest || kind == outboxKindPayment
 }
 
 func (o *outbox) markDone(key []byte) error {

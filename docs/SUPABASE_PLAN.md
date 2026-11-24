@@ -50,7 +50,7 @@ firewall holes, no public exposure of Postgres.
 | **Cross-region failover** | ✅ **cascading priorities** in envoy geo clusters — see §2.6 |
 | **SFX video delivery** | ✅ **signing on the Go mesh + CF edge cache** for `objects.solofx.net` — see §15 |
 | **us1/Edge security hardening** | ✅ **firewall + SSH + fail2ban** — see §16. DB/admin ports now Tailscale-only; public web/streaming/payment untouched. ❗ **Ufw NOT enabled** (would flush Docker's FORWARD chain) |
-| **Dart BFF Gateway** | ✅ **deployed on us1/Edge (`saltmedia-bff`)** — Server-Driven UI at `/api/v1/bff/layout/home` (2ms latency) + HMAC security handshake — see §20 |
+| **Dart BFF Gateway** | ✅ **deployed on us1/Edge, eu1, and ug** — Server-Driven UI at `/api/v1/bff/layout/home` (2ms latency) + HMAC security handshake; Edge Envoy geo-routes BFF GET/HEAD requests by `CF-IPCountry` — see §20–21 |
 
 ### Replication plumbing (us1 → ug)
 - Replicator role: `replicator` / password in `.env` (`REPLICATOR_PASSWORD`).
@@ -998,29 +998,32 @@ Full design, implementation, and deployment of the **Dart BFF Gateway** (`saltme
 - **Dart BFF (`saltmedia-bff`)**: Serves as the API gateway for the Flutter app (`saltmedia`), aggregating data, validating MTN MoMo subscriptions, and delivering Server-Driven UI (SDUI) layout responses.
 - **Shared Package (`saltmedia_shared`)**: Pure Dart package (`MediaItem`, `UIComponent`, `HomeLayoutResponse`) shared by both Flutter app and Dart BFF for 100% compile-time type safety.
 
-### 20.2 Envoy Routing & Cluster Setup
-- **Envoy Cluster (`replica-configs/us1/envoy-cds.yaml`)**:
-  ```yaml
-  - '@type': type.googleapis.com/envoy.config.cluster.v3.Cluster
-    name: dart_bff
-    connect_timeout: 5s
-    type: STRICT_DNS
-    dns_refresh_rate: 5s
-    lb_policy: ROUND_ROBIN
-    load_assignment:
-      cluster_name: dart_bff
-      endpoints:
-        - lb_endpoints:
-            - endpoint:
-                address:
-                  socket_address:
-                    address: saltmedia-bff
-                    port_value: 8080
-  ```
-- **Envoy Route (`replica-configs/us1/envoy-lds.template.yaml`)**:
-  - `prefix: /api/v1/bff/` routed directly to cluster `dart_bff` on container port 8080 (`saltmedia-bff` on `supabase_default` network).
-  - Placed before `/api/v1/` catch-all route so requests bypass legacy `gofn` dispatcher.
-  - Configured with `typed_per_filter_config` to allow public client access without basic auth.
+### 20.2 Envoy Routing & Cluster Setup (Nov 2026)
+- **BFF clusters on Edge Envoy** (`cds.yaml`):
+  - `dart_bff`: US local → EU → UG failover.
+  - `eu1_bff`: EU local → UG → US failover.
+  - `ug_bff`: UG local → EU → US failover.
+  - All use `http_health_check: /healthz`.
+- **Envoy routes** (`lds.template.yaml`):
+  - `GET/HEAD /api/v1/bff/*` is selected by `cf-ipcountry`: EU countries → `eu1_bff`, African countries → `ug_bff`, everyone else → `dart_bff` (US).
+  - `GET/HEAD /tv` and `/tv-login` use the same country selection.
+  - All other BFF methods (including device-auth POSTs and purge-cache) fall through to `dart_bff` on US, so stateful operations stay on the primary session store.
+  - All BFF routes bypass basic auth via `typed_per_filter_config`.
+- **Important boundary**: the front door is still the US Edge tunnel. Geo-routed requests travel Edge → EU/UG BFF over Tailscale; this reduces US backend/mesh load and keeps reads regional, but it is not a direct Cloudflare-to-EU/UG front door.
+
+```yaml
+- "@type": type.googleapis.com/envoy.config.cluster.v3.Cluster
+  name: dart_bff
+  type: STRICT_DNS
+  lb_policy: ROUND_ROBIN
+  load_assignment:
+    endpoints:
+      - priority: 0   # us1 saltmedia-bff:8080
+      - priority: 1   # eu1 100.116.100.32:8088
+      - priority: 2   # ug  100.116.185.70:8088
+  health_checks:
+    - http_health_check: { path: "/healthz" }
+```
 
 ### 20.3 Live Verification & Response Metrics
 - **Public Endpoint**: `https://edge.solofx.net/api/v1/bff/layout/home`
@@ -1038,7 +1041,48 @@ Full design, implementation, and deployment of the **Dart BFF Gateway** (`saltme
   3. **Tier 3**: Static local fallback layout (`lib/services/fallback_layout.dart`) if offline.
 
 ### 20.5 Multi-Region Replica Expansion (`eu1`, `eu2`, `us2`, `ug`) ✅
-- **Phase 2 Expansion Completed**: `saltmedia-bff` containers are deployed across `us1` (US East Primary), `eu1` (Frankfurt, Europe), and `ug` (QNAP Kampala, Africa), providing 100% regional high-availability and zero cross-Atlantic network delays for catalog and layout reads.
+- **Base deployment**: `saltmedia-bff` runs on `us1` (US East primary), `eu1` (Europe), and `ug` (QNAP Kampala).
+- **Nov 14 2026 rollout**: EU and UG were upgraded to the current `saltmedia-bff:cluster-20261114` image and now use their local PostgREST RPC endpoints:
+  - EU: `http://127.0.0.1:5556/rest/v1`
+  - UG: `http://100.116.185.70:5556/rest/v1`
+- Both nodes now return the full catalog (`~77 KB`, 7 shows, seasons/episodes included), matching US. Previously they returned `~17–19 KB` and missing seasons.
+- Edge Envoy geo-routes **BFF GET/HEAD** reads by `CF-IPCountry`; writes and TV device-auth POSTs remain US-only. Shared Upstash session storage is **not yet enabled**.
+
+### 20.6 Automated BFF image rollout (Nov 2026) ✅
+- **CI build**: `.github/workflows/bff-image.yml` builds on pushes touching `packages/saltmedia_bff/**` or `packages/saltmedia_shared/**` on `main` / `backup-play-pause-fix`, and via `workflow_dispatch`.
+- **Private registry**: `ghcr.io/solog80/saltmedia-bff:latest` plus `sha-<short>` tags. The package is private; GitHub Actions pushes with `GITHUB_TOKEN`.
+- **Watchtower**: `containrrr/watchtower:1.7.1` runs on Edge, EU, and UG with `--label-enable --interval 60 --cleanup`. Only containers labeled `com.centurylinklabs.watchtower.enable=true` are touched.
+- **Pull auth**: classic GitHub PAT with only `read:packages`, stored in node-local `watchtower.env` files (`chmod 600`), never in the repo.
+- **Edge exception**: Edge Docker 29 requires `DOCKER_API_VERSION=1.44` for Watchtower.
+- **Verified rollout**: a `workflow_dispatch` rebuild produced image `eddbdfb04214`; Edge, EU, and UG all pulled and recreated BFF within ~60s. All three returned `200` and the full `77 KB` catalog afterward.
+
+### 20.7 Envoy CDS/LDS auto-reload ✅ (Nov 14 2026)
+- **Problem**: `path_config_source` was not watching config changes; LDS was generated only at container startup.
+- **Envoy config**: both `cds_config` and `lds_config` now use `watched_directory: /etc/envoy`.
+- **CDS**: Envoy reads `/etc/envoy/cds.active.yaml`. The entrypoint copies bind-mounted `cds.yaml` to `cds.active.yaml` atomically (`tmp` + `mv`).
+- **LDS**: the entrypoint renders `lds.template.yaml` → `lds.yaml` atomically.
+- **Watcher**: a 2-second checksum loop regenerates the active CDS/LDS file when the host sources change. Envoy then reloads clusters/listeners in place.
+- **Verified**: temporary LDS timeout change and CDS `dns_refresh_rate` change both reloaded without restarting the container; sources were reverted afterward.
+- **Backups**: `envoy.yaml.bak.20261114-autoreload`, `docker-entrypoint.sh.bak.20261114-autoreload`, `envoy.yaml.bak.20261114-active-cds`, `docker-entrypoint.sh.bak.20261114-active-cds`.
+- **Rule**: edit host `cds.yaml` / `lds.template.yaml`; never edit generated `cds.active.yaml` or `lds.yaml` inside the container.
+
+### 20.8 Automation roadmap (recommended)
+| Priority | Automation | Trigger | Validation / rollback |
+|---|---|---|---|
+| **P0 (next)** | **Envoy config sync** | Push touching `replica-configs/us1/envoy-*` | Parse YAML, copy to host via atomic rename, expect `lds: add/update listener` / `cds: add/update cluster`; rollback from the timestamped `.bak` file. |
+| **P1** | **Supabase migrations + PostgREST reload** | Merge touching SQL migrations | Apply on primary, then `NOTIFY pgrst, 'reload schema'`; restart replica PostgREST after DDL. Roll back with a down migration; never auto-run destructive SQL. |
+| **P1** | **Post-deploy smoke tests** | After every BFF, Envoy, or Supabase deploy | Check `/healthz`, BFF catalog, `/tv-login`, and Envoy cluster health. Alert/fail closed on non-200 or missing seasons. |
+| **P2** | **Varnish VCL** | VCL source change | Validate with `varnishd -C`; reload with `varnishadm vcl.load` / `vcl.use`; keep the previous VCL label for instant rollback. |
+| **P2** | **BFF env/secrets rollout** | Secret or env change | Render node env files atomically, restart BFF rolling, verify catalog, keep the previous env file. No secrets in git. |
+| **P2** | **Cloudflare DNS/tunnel** | Terraform/API change | Run plan/dry-run, verify `edge.solofx.net` and future `ug-edge` routing; roll back previous DNS/tunnel config. Keep tunnel tokens out of the repo. |
+| **P3** | **App release** | Tag or manual dispatch | Build/sign AAB, upload to Play internal track, then promote manually after smoke tests. |
+
+**Keep manual:**
+- Postgres promotion/failover and failback.
+- WAL-G restore/PITR.
+- Destructive or irreversible migrations.
+- Cloudflare tunnel token rotation.
+- Any change that cannot be validated before applying.
 
 ---
 
@@ -1046,14 +1090,21 @@ Full design, implementation, and deployment of the **Dart BFF Gateway** (`saltme
 
 ### 21.1 Deployed Multi-Region Replica BFF Topology
 
-| Node / Region | Host / IP | Local Container Port | Go Mesh & DB Endpoint | Health Check Status | Priority Tier |
+| Node / Region | Host / IP | BFF Port | Catalog/RPC Backend | Health | Selection |
 |---|---|---|---|---|---|
-| **us1 (Primary)** | `Edge` (`100.74.77.39`) | `:8080` | `http://100.74.77.39:8090` | ✅ `200 OK` | **Prio 0** (Primary) |
-| **eu1 (Europe)** | `origin-contabo` (`100.116.100.32`) | `:8088` | `http://100.116.100.32:5557` | ✅ `200 OK` | **Prio 1** (EU Failover) |
-| **ug (Africa)** | `nas-ts` QNAP (`100.116.185.70`) | `:8088` | `http://100.116.185.70:5556` | ✅ `200 OK` | **Prio 2** (Africa Failover) |
+| **us1 (Primary)** | `Edge` (`100.74.77.39`) | `saltmedia-bff:8080` | `http://supabase-rest:3000` | ✅ `200` | Default / non-GET |
+| **eu1 (Europe)** | `origin-contabo` (`100.116.100.32`) | `:8088` | `http://127.0.0.1:5556/rest/v1` | ✅ `200` | EU `cf-ipcountry` |
+| **ug (Africa)** | `nas-ts` QNAP (`100.116.185.70`) | `:8088` | `http://100.116.185.70:5556/rest/v1` | ✅ `200` | African `cf-ipcountry` |
+
+Verified Nov 14 2026: `CF-IPCountry: DE` served by EU, `UG` served by UG, default served by US; all returned 7 shows with seasons. TV-login GETs geo-route; auth POSTs remained on US.
 
 ### 21.2 Envoy Cascading Priority Configuration (`replica-configs/us1/envoy-cds.yaml`)
-Envoy's `dart_bff` cluster routes requests across the 3 BFF instances with priority tiers and automatic health checking:
+Envoy uses three clusters with `/healthz` checks:
+- `dart_bff`: US → EU → UG
+- `eu1_bff`: EU → UG → US
+- `ug_bff`: UG → EU → US
+
+`GET/HEAD /api/v1/bff/*` and `/tv*` select a cluster using `cf-ipcountry`; all other methods use `dart_bff` (US). The US `dart_bff` example:
 ```yaml
   - '@type': type.googleapis.com/envoy.config.cluster.v3.Cluster
     name: dart_bff
@@ -1095,7 +1146,15 @@ Envoy's `dart_bff` cluster routes requests across the 3 BFF instances with prior
 1. **Cold Start**: App displays Hive cache (`ondemand:published_v2`) in **0ms**.
 2. **Network Request**: App calls `GET /api/v1/bff/ondemand/catalog` (Cloudflare attaches `CF-IPCountry: UG`).
 3. **Cloudflare Edge CDN**: Serves cached response in **~10ms** if Edge hit.
-4. **Envoy Geo-Routing**: On CDN miss, Envoy routes request to `ug` replica (`100.116.185.70:8088` on QNAP Kampala).
+4. **Envoy Geo-Routing**: On CDN miss, Envoy routes GET/HEAD to `ug_bff` (`100.116.185.70:8088` on QNAP Kampala) over Tailscale. The UG BFF reads its local PostgREST RPC (`http://100.116.185.70:5556/rest/v1`).
+5. **Stateful path**: TV device login (`POST .../auth/device/start`, `/poll`, `/approve`) and BFF writes stay on US `dart_bff` because sessions are still in-memory; shared Redis is not configured.
+6. **Failover**: If the UG BFF fails health checks, `ug_bff` priority moves to EU, then US.
+
+### 21.5 Current limits / next step
+- Catalog/EPG/banner GETs are regionally served and reduce US mesh/Redis usage.
+- Front-door latency still includes Cloudflare → US Edge → regional BFF. Measured from Uganda: Cloudflare cache HIT ≈50ms, cross-region catalog miss ≈1.1s; US BFF direct from Edge ≈10ms.
+- A true direct UG front door would require a working public UG BFF hostname/tunnel route. `ug-edge.solofx.net` currently lands on Supabase Studio Basic Auth, not the BFF.
+- For geo-routed device auth or multi-region BFF writes, enable a shared Upstash Redis token on all three BFFs (or sticky routing) before routing non-GET BFF traffic by country.
 
 ---
 
@@ -1200,3 +1259,140 @@ Automates commercial spot reconciliation and client billing affidavits for **Sal
    - Pre-built distribution zip: `StationPlaylist.TrafficAgent-win-x64.zip`.
    - Zero-install fallback: `scripts/StationPlaylist-TrafficSync.ps1` for Task Scheduler.
    - Verified live: Ingested 120 advert plays from `SLog-261014.csv` with 100% accuracy.
+
+---
+
+## 24. Payments — Yo! → TimescaleDB + email receipts (Nov 2026)
+
+The new app pays through the **Dart BFF** (no API key in the client) → **Go mesh**
+→ Yo!. The mesh writes one payment ledger to **TimescaleDB**, which is the
+dashboard's source for up-to-1-year queries. Supabase Postgres holds only the
+ephemeral rate-limit counters; **no Upstash** and **no Directus** on this path.
+
+### Data flow
+
+```text
+New app ──► BFF /api/v1/bff/payments/yo/{initiate,status}   (keyless)
+                 ▼
+          Go mesh (service key)
+            ├─ rate limit: Supabase public.rate_limits + check_rate_limit()
+            ├─ Yo! API (acdepositfunds / actransactioncheckstatus)
+            ├─ analytics.payments (Timescale hypertable)          ← dashboard
+            ├─ payment.upsert outbox when Timescale is down
+            └─ email receipt poller ──► SMTP + system_emails
+
+Legacy app ──► Firebase initiate/check (unchanged IPN/failure URLs)
+Yo IPN/failure ──► Firebase yoWebhooks ──► POST /api/v1/recordYoPayment ──► Timescale
+  (mesh POST /api/v1/yoIpn and /api/v1/yoFailure are ready for the future cutover)
+
+Admin dashboard ──► GET /api/v1/getPaymentMetrics ──► Timescale
+```
+
+### Migrations
+- `migrations/tsdb_017_payments.sql` — `analytics.payments` hypertable
+  (`created_at` time column, mutable status row per payment, indexes for
+  provider/status/phone; **no compression**, no retention).
+- `migrations/017_payment_rate_limits.sql` — `public.rate_limits` (UNLOGGED) +
+  `check_rate_limit(p_key, p_limit, p_window_seconds)`.
+
+### Upsert rules
+`payment_uid = 'YO:<TransactionReference>'`. Writes are **update-first under
+`pg_advisory_xact_lock(hashtext(payment_uid))`**, so retries never duplicate and
+`created_at` stays stable. Timescale outages enqueue a `payment.upsert` job in
+the durable bbolt outbox; status reads still query Yo! live.
+
+### Dashboard
+- `saltmedia-admin-app/src/app/api/payments/route.ts` calls
+  `GET /api/v1/getPaymentMetrics?days=` with the service key; the Go handler
+  queries Timescale and returns the same JSON shape as the old BigQuery
+  function.
+- **No backfill** (by decision): the page shows cutover-onward data. BigQuery and
+  Directus are no longer used for payments.
+
+### Email receipts
+The existing SMTP mailer + `renderContributionEmail` templates are reused. The
+poller reads `analytics.payments WHERE status = 'COMPLETED'` (lookback
+`CONTRIBUTION_EMAIL_LOOKBACK_HOURS`, floor `CONTRIBUTION_EMAIL_SINCE`). It uses
+the signed-in app user's `payer_email` first (sent at initiate), then the Yo! IPN
+`payer_email` when present, then falls back to Firestore subscriptions/users +
+Supabase `users`. Anonymous users (no email) are skipped. It claims
+`system_emails` key `contribution:<payment_uid>` before sending so each payment
+gets exactly one receipt. Unmatched payments are logged `skipped`; when
+`CONTRIBUTION_FALLBACK_EMAIL` is set, the admin inbox gets the alert instead.
+
+### KYC
+The mesh exposes `getMsisdnKycInfo` (Yo! `acgetmsisdnkycinfo`, API 3.48 §14) and
+the BFF proxies it at `/api/v1/bff/payments/yo/kyc`. Per Yo! support, KYC uses
+the dedicated sandbox `YO_KYC_API_URL` / `YO_KYC_API_USERNAME` /
+`YO_KYC_API_PASSWORD`; payments and status keep using the production
+`YO_API_*`. The Flutter form verifies both MTN and Yo! numbers before payment,
+and the mesh **re-verifies on `initiateYoDeposit`** so a client cannot bypass
+the check. Unverified, blacklisted, lookup-failed and KYC-unavailable numbers
+are rejected (fail closed). Results are cached for `YO_KYC_CACHE_TTL_SECONDS`
+(default 600) and rate-limited to protect Yo!/the mesh from repeated requests.
+The legacy Firebase path and the current Firebase MoMo proxy are not
+server-enforced yet; the new app UI still gates them.
+
+### IPN cutover
+`YO_IPN_URL`/`YO_FAILURE_URL` remain the **Firebase** webhook URLs so old app
+builds are unaffected. Mesh-initiated deposits use the same URLs and
+`recordYoPayment` keeps the ledger current. Once the old app is retired, point
+the URLs at `https://edge.solofx.net/api/v1/yoIpn` and `/yoFailure` — both
+handlers re-query Yo! before writing.
+
+### Env (us1 `supabase-api`, mounted as `payments.env`)
+Keep them in **`superbase-cluster/.env`** (gitignored) and deploy that file to
+Edge as `/opt/salt-secrets/payments.env` (pass with `--env-file`):
+`YO_API_URL`, `YO_API_USERNAME`, `YO_API_PASSWORD`, `YO_KYC_API_URL`,
+`YO_KYC_API_USERNAME`, `YO_KYC_API_PASSWORD`, `YO_IPN_URL`,
+`YO_FAILURE_URL`, plus the existing `SMTP_*` and `CONTRIBUTION_EMAIL_*` tuning.
+
+### Outbox
+`payment.upsert` is a priority job kind (alongside video/radio traffic) so a
+Timescale outage does not delay payment replay behind analytics snapshots.
+
+---
+
+## 25. MTN MoMo — new app via mesh, old app via Directus (Nov 2026)
+
+### New app path
+```text
+App → BFF /api/v1/bff/payments/momo/{initiate,status}
+    → Go mesh initiateMomoPayment / checkMomoPaymentStatus
+    → MTN RequestToPay / status
+    → Timescale payments (provider MTNUG_MOMO)
+```
+- Mesh re-verifies KYC server-side (same `lookupMsisdnKyc` cache/rate limits as
+  Yo) and applies `momo:initiate` / `momo:status` rate limits.
+- MTN token is cached in the mesh (`MTN_MOMO_*`).
+- No Directus dependency in the new app.
+
+### Callback / IPN
+- The mesh sends `X-Callback-Url = MOMO_CALLBACK_URL?reference=<ref>`.
+- **The active target is the mesh URL**
+  (`https://edge.solofx.net/api/v1/momoCallback`). The Directus flow URL is
+  commented out for the legacy/cutover path.
+- New-app MoMo no longer creates Directus rows while the mesh callback is
+  active. Old-app MoMo still uses the Directus flow.
+- The MTN dashboard default callback can remain the CMS URL until cutover; the
+  per-request mesh callback overrides it. Switching the dashboard default is a
+  config change, no app update.
+- The mesh callback re-queries MTN status before writing; it does not trust the
+  callback body.
+
+### Old app (unchanged)
+Firebase `proxyMomoPayment` → Directus flow remains as-is. Old-app MoMo records
+stay in Directus; they are not synced to Timescale and are not included in the
+Timescale dashboard/receipt poller.
+
+### BFF auto-update
+Pushes touching `packages/saltmedia_bff/**` on `backup-play-pause-fix` build and
+publish `ghcr.io/solog80/saltmedia-bff:latest`; Watchtower updates Edge/eu1/ug.
+All BFF nodes need `GO_API_URL` + `MESH_SERVICE_KEY`; Edge needs the Watchtower
+label.
+
+### Current limitation
+MTN’s Validate Account Holder permission is still denied, and Yo’s
+`acverifyaccountvalidity` is unsupported for these providers. KYC therefore
+verifies identity/blacklist, not mobile-money enablement; a registered
+non-MoMo number passes KYC and fails at RequestToPay.

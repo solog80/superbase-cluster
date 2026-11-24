@@ -35,6 +35,9 @@ type server struct {
 
 	tsdb   *tsdbConn
 	outbox *outbox
+	mail   *mailer
+
+	emailTableWarnOnce sync.Once
 
 	adsMu    sync.Mutex
 	adsCache map[string]adsCacheEntry
@@ -59,6 +62,13 @@ type server struct {
 	odThumbMu      sync.Mutex
 	odThumbCache   map[string]string
 	odThumbExpires time.Time
+
+	kycMu    sync.Mutex
+	kycCache map[string]kycCacheEntry
+
+	momoMu          sync.Mutex
+	momoToken       string
+	momoTokenExpiry time.Time
 
 	// Serializes broadcast pushes (one at a time, TryLock for "in progress").
 	broadcastMu sync.Mutex
@@ -93,11 +103,13 @@ func main() {
 		osPass:       os.Getenv("OPENSEARCH_PASSWORD"),
 		osInsecure:   os.Getenv("OPENSEARCH_INSECURE") == "1",
 		tsdb:         tsdb,
+		mail:         newMailer(),
 		adsCache:     map[string]adsCacheEntry{},
 		rpcCache:     map[string]rpcCacheEntry{},
 		epgCache:     map[string]epgCacheEntry{},
 		odCache:      nil,
 		odThumbCache: map[string]string{},
+		kycCache:     map[string]kycCacheEntry{},
 
 		smsAgentKey:   os.Getenv("SMS_AGENT_KEY"),
 		waAppSecret:   os.Getenv("WA_APP_SECRET"),
@@ -134,6 +146,8 @@ func main() {
 	s.startScheduler()
 	s.startChatScheduler()
 	s.startNotificationStaleCleanup()
+	s.startSystemEmailPollers()
+	s.startPaymentMaintenance()
 
 	go globalVarnishTracker.StartCleanupLoop(15*time.Second, 120*time.Minute)
 	go startVarnishUDPListener(getenv("VARNISH_LOG_PORT", "8092"))
@@ -180,6 +194,33 @@ func (s *server) dispatch(w http.ResponseWriter, r *http.Request) {
 		s.handleReplayOutboxDead(w, r)
 	case "getApiConfig":
 		s.handleGetApiConfig(w, r)
+	case "initiateYoDeposit", "checkYoTransactionStatus", "recordYoPayment", "getPaymentMetrics", "getMsisdnKycInfo", "initiateMomoPayment", "checkMomoPaymentStatus":
+		if !s.isServiceKey(r) {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"success": false, "error": "Unauthorized: service key required"})
+			return
+		}
+		switch name {
+		case "initiateYoDeposit":
+			s.handleInitiateYoDeposit(w, r)
+		case "checkYoTransactionStatus":
+			s.handleCheckYoTransactionStatus(w, r)
+		case "recordYoPayment":
+			s.handleRecordYoPayment(w, r)
+		case "getPaymentMetrics":
+			s.handleGetPaymentMetrics(w, r)
+		case "getMsisdnKycInfo":
+			s.handleGetMsisdnKycInfo(w, r)
+		case "initiateMomoPayment":
+			s.handleInitiateMomoPayment(w, r)
+		case "checkMomoPaymentStatus":
+			s.handleCheckMomoPaymentStatus(w, r)
+		}
+	case "yoIpn":
+		s.handleYoWebhook(w, r, false)
+	case "yoFailure":
+		s.handleYoWebhook(w, r, true)
+	case "momoCallback":
+		s.handleMomoCallback(w, r)
 	case "catalog":
 		s.handleCatalog(w, r)
 	case "searchUsers":
@@ -288,6 +329,12 @@ func (s *server) dispatch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.enqueueSmsReply(w, r)
+	case "sendSystemEmail":
+		if !s.isServiceKey(r) {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"success": false, "error": "Unauthorized: Admin access required"})
+			return
+		}
+		s.handleSendSystemEmail(w, r)
 	case "getAnalyticsMetrics":
 		s.handleGetAnalyticsMetrics(w, r)
 	case "getFirebaseAnalytics":
@@ -525,7 +572,10 @@ func (s *server) publicFn(name string) bool {
 		"getPublicOnDemandData",
 		"getSignedPlaylist",
 		"ondemandHealthCheck",
-		"bunnyWebhook":
+		"bunnyWebhook",
+		"yoIpn",
+		"yoFailure",
+		"momoCallback":
 		return true
 	}
 	return false
